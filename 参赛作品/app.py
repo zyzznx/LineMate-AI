@@ -911,10 +911,17 @@ def run_global_optimization(operations):
         return "warning", "未知的全局优化指令。", None
 
     production_line = st.session_state.get("production_line", [])
+    if st.session_state.get("is_globally_optimized", False):
+        return (
+            "warning",
+            "⚠️ 当前产线已是优化状态，如需重新配置，请先点击‘重置产线’或重新选择行业模板。",
+            None,
+        )
     if not production_line:
         return "warning", "当前产线没有可执行工位。", None
     if "initial_production_line" not in st.session_state:
-        st.session_state["initial_production_line"] = snapshot_production_line()
+        reset_optimization_baseline()
+    initial_takt = st.session_state.get("initial_takt", {})
 
     database = st.session_state.get("arm_database")
     model_library = pd.DataFrame()
@@ -1030,9 +1037,14 @@ def run_global_optimization(operations):
                 current_values = {}
                 for operation in operations:
                     column = GLOBAL_OPTIMIZATION_OPERATIONS[operation]["metric"]
-                    current_values[column] = _effective_item_metric(
-                        item, current_model, column
-                    )
+                    if column == "节拍秒数":
+                        current_values[column] = initial_takt.get(
+                            item.get("name"), item.get("takt")
+                        )
+                    else:
+                        current_values[column] = _effective_item_metric(
+                            item, current_model, column
+                        )
                 replacement_row, has_conflict = _select_compound_replacement(
                     pool, current_values, operations
                 )
@@ -1042,9 +1054,14 @@ def run_global_optimization(operations):
                 config = GLOBAL_OPTIMIZATION_OPERATIONS[operations[0]]
                 metric_column = config["metric"]
                 prefer = config["prefer"]
-                current_value = _effective_item_metric(
-                    item, current_model, metric_column
-                )
+                if metric_column == "节拍秒数":
+                    current_value = initial_takt.get(
+                        item.get("name"), item.get("takt")
+                    )
+                else:
+                    current_value = _effective_item_metric(
+                        item, current_model, metric_column
+                    )
                 candidates = pool
                 validity_column = METRIC_VALIDITY_COLUMNS.get(metric_column)
                 if (
@@ -1098,9 +1115,14 @@ def run_global_optimization(operations):
             for operation in operations:
                 config = GLOBAL_OPTIMIZATION_OPERATIONS[operation]
                 metric_column = config["metric"]
-                current_value = _effective_item_metric(
-                    item, current_model, metric_column
-                )
+                if metric_column == "节拍秒数":
+                    current_value = initial_takt.get(
+                        item.get("name"), item.get("takt")
+                    )
+                else:
+                    current_value = _effective_item_metric(
+                        item, current_model, metric_column
+                    )
                 if pd.isna(current_value) or current_value <= 0:
                     continue
                 factor = 0.8 if config["prefer"] == "min" else 1.2
@@ -1152,6 +1174,7 @@ def run_global_optimization(operations):
             "⚠️ 未在当前数据库中找到符合要求的机型，产线未改变。",
             None,
         )
+    st.session_state["is_globally_optimized"] = True
 
     if is_compound:
         labels = "、".join(
@@ -1345,16 +1368,27 @@ def sync_line_state():
 
 
 def snapshot_production_line():
-    return [
-        {"name": item["name"], "model": item.get("model", "未配置"), "takt": item["takt"]}
-        for item in st.session_state.get("production_line", [])
-    ]
+    return [dict(item) for item in st.session_state.get("production_line", [])]
 
 
 def reset_optimization_baseline():
     st.session_state["initial_production_line"] = snapshot_production_line()
+    st.session_state["initial_takt"] = {
+        item["name"]: item["takt"]
+        for item in st.session_state["initial_production_line"]
+    }
     st.session_state["optimization_applied"] = False
+    st.session_state["is_globally_optimized"] = False
     # 产线结构/模板发生变化后，清空各工位的已优化状态
+    st.session_state["station_optimization_flags"] = {}
+
+
+def reset_production_line():
+    baseline = st.session_state.get("initial_production_line", [])
+    st.session_state["production_line"] = [dict(item) for item in baseline]
+    sync_line_state()
+    st.session_state["optimization_applied"] = False
+    st.session_state["is_globally_optimized"] = False
     st.session_state["station_optimization_flags"] = {}
 
 
@@ -1693,7 +1727,12 @@ if "production_line" not in st.session_state:
 
 sync_line_state()
 st.session_state.setdefault("initial_production_line", snapshot_production_line())
+st.session_state.setdefault(
+    "initial_takt",
+    {item["name"]: item["takt"] for item in st.session_state["initial_production_line"]},
+)
 st.session_state.setdefault("optimization_applied", False)
+st.session_state.setdefault("is_globally_optimized", False)
 st.session_state.setdefault("target_capacity", 100)
 st.session_state.setdefault("ai_parsed_result", None)
 st.session_state.setdefault("ai_parse_mode", None)
@@ -2370,6 +2409,10 @@ with st.sidebar:
         mime="text/csv",
         key="download_production_template",
     )
+
+    if st.button("重置产线", key="reset_production_line_button"):
+        reset_production_line()
+        st.rerun()
 
     st.header("AI 设置区")
     ai_provider = st.selectbox(
