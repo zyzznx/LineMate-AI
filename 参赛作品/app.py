@@ -4,10 +4,12 @@ import io
 import json
 import re
 import textwrap
+import traceback
 
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+from streamlit.errors import StreamlitSecretNotFoundError
 
 
 def parse_first_number(val):
@@ -186,9 +188,78 @@ def normalize_numeric(value, default=0.0):
     return float(default)
 
 
+def format_display_number(value, digits=1):
+    """统一节拍/瓶颈/产能等数值的展示格式，先四舍五入再渲染，避免浮点误差。"""
+    number = normalize_numeric(value, default=0.0)
+    rounded = round(number, digits)
+    if rounded == 0:
+        rounded = 0.0  # 把 -0.0 统一为 0
+    return f"{rounded:g}"
+
+
+def _numeric_text(value):
+    return "" if value is None else str(value).strip().lower()
+
+
+def parse_price_to_yuan(value):
+    """把“30万 / ¥150,000 / 150000元”等价格统一转换为元。"""
+    amount = normalize_numeric(value, default=float("nan"))
+    if pd.isna(amount):
+        return float("nan")
+    text = _numeric_text(value)
+    if "万" in text:
+        return amount * 10000
+    if "千" in text:
+        return amount * 1000
+    return amount
+
+
+def parse_precision_to_mm(value):
+    """把“±0.02 mm / 0.02um”等精度统一转换为毫米。"""
+    amount = normalize_numeric(value, default=float("nan"))
+    if pd.isna(amount):
+        return float("nan")
+    text = _numeric_text(value)
+    if "μm" in text or "um" in text or "微米" in text:
+        return amount / 1000
+    if "cm" in text:
+        return amount * 10
+    return amount
+
+
+def parse_reach_to_mm(value):
+    """把“1.2m / 900mm”等臂展统一转换为毫米。"""
+    amount = normalize_numeric(value, default=float("nan"))
+    if pd.isna(amount):
+        return float("nan")
+    text = _numeric_text(value)
+    if re.search(r"\d\s*m(?![m])", text):
+        return amount * 1000
+    return amount
+
+
+def parse_takt_to_seconds(value):
+    """把“20s / 0.5min”等节拍统一转换为秒。"""
+    amount = normalize_numeric(value, default=float("nan"))
+    if pd.isna(amount):
+        return float("nan")
+    text = _numeric_text(value)
+    if "min" in text or "分钟" in text:
+        return amount * 60
+    return amount
+
+
 def ensure_arm_database_columns(database):
     if database is None:
-        return pd.DataFrame(columns=["工位", "机型", "产地", "品牌产地", "品牌名称", "工序类型", "臂展半径", "承重(kg)", "精度", "精度(mm)", "是否支持视觉", "IP防护", "运行速度", "通讯接口", "耐用性", "核心特点", "瓶颈局限性", "Pros", "Cons", "价格", "维保响应", "节拍秒数"])
+        return pd.DataFrame(
+            columns=[
+                "工位", "机型", "产地", "品牌产地", "品牌名称", "工序类型",
+                "臂展半径", "承重(kg)", "精度", "精度(mm)", "是否支持视觉",
+                "IP防护", "运行速度", "运行速度(m/s)", "通讯接口", "耐用性",
+                "核心特点", "瓶颈局限性", "Pros", "Cons", "价格", "维保响应",
+                "节拍秒数", "占地估算(㎡)", "成本(万元)",
+            ]
+        )
 
     database = clean_arm_database_column_names(database)
     column_aliases = {
@@ -199,6 +270,10 @@ def ensure_arm_database_columns(database):
         "负载": "承重(kg)",
         "承重": "承重(kg)",
         "防护等级": "IP防护",
+        "运行速度（m/s）": "运行速度(m/s)",
+        "运行速度 m/s": "运行速度(m/s)",
+        "运行速度（%）": "运行速度(%)",
+        "运行速度 %": "运行速度(%)",
     }
     for column in list(database.columns):
         target = column_aliases.get(column)
@@ -241,6 +316,16 @@ def ensure_arm_database_columns(database):
         database["IP防护"] = None
     if "运行速度" not in database.columns:
         database["运行速度"] = None
+    if "运行速度(m/s)" not in database.columns and "运行速度(%)" not in database.columns:
+        database["运行速度(m/s)"] = 1.0
+    for column, default_speed in (("运行速度(m/s)", 1.0), ("运行速度(%)", 100.0)):
+        if column in database.columns:
+            database[column] = pd.to_numeric(
+                database[column].map(
+                    lambda value: normalize_numeric(value, default=float("nan"))
+                ),
+                errors="coerce",
+            ).fillna(default_speed)
     if "通讯接口" not in database.columns:
         database["通讯接口"] = None
     if "耐用性" not in database.columns:
@@ -274,14 +359,31 @@ def ensure_arm_database_columns(database):
         database["产地"].ne(""), database["品牌产地"]
     )
     database["工序类型"] = database["工序类型"].fillna("装配").astype(str).str.strip()
-    database["臂展半径"] = pd.to_numeric(database["臂展半径"], errors="coerce").fillna(800.0)
+    parsed_reach = pd.to_numeric(
+        database["臂展半径"].map(parse_reach_to_mm), errors="coerce"
+    )
+    if "_臂展有效" not in database.columns:
+        database["_臂展有效"] = parsed_reach.gt(0).fillna(False)
+    database["臂展半径"] = parsed_reach.fillna(800.0)
+    database["占地估算(㎡)"] = (database["臂展半径"] / 1000) ** 2 * 3.14
     database["承重(kg)"] = pd.to_numeric(database["承重(kg)"], errors="coerce").fillna(10.0)
     database["精度"] = database["精度"].where(
         database["精度"].notna() & database["精度"].astype(str).str.strip().ne(""),
         database["精度(mm)"],
     )
-    database["精度(mm)"] = pd.to_numeric(database["精度(mm)"], errors="coerce").fillna(
-        pd.to_numeric(database["精度"].map(parse_first_number), errors="coerce").fillna(0.05)
+    parsed_precision = pd.to_numeric(
+        database["精度(mm)"].map(parse_precision_to_mm), errors="coerce"
+    )
+    parsed_precision_fallback = pd.to_numeric(
+        database["精度"].map(parse_precision_to_mm), errors="coerce"
+    )
+    if "_精度有效" not in database.columns:
+        database["_精度有效"] = (
+            parsed_precision.gt(0).fillna(False)
+            | parsed_precision_fallback.gt(0).fillna(False)
+        )
+    database["精度(mm)"] = parsed_precision.fillna(
+        parsed_precision_fallback.fillna(0.05)
     )
     database["是否支持视觉"] = database["是否支持视觉"].map(normalize_bool).fillna(False)
     database["IP防护"] = database["IP防护"].fillna("").astype(str).str.strip().replace("", "IP65")
@@ -292,7 +394,13 @@ def ensure_arm_database_columns(database):
     database["耐用性"] = database["耐用性"].fillna("").astype(str).str.strip().replace("", "MTBF 80,000小时")
     database["核心特点"] = database["核心特点"].fillna("").astype(str)
     database["瓶颈局限性"] = database["瓶颈局限性"].fillna("").astype(str)
-    database["价格"] = pd.to_numeric(database["价格"].map(normalize_numeric), errors="coerce").fillna(0)
+    parsed_price = pd.to_numeric(
+        database["价格"].map(parse_price_to_yuan), errors="coerce"
+    )
+    if "_价格有效" not in database.columns:
+        database["_价格有效"] = parsed_price.gt(0).fillna(False)
+    database["价格"] = parsed_price.fillna(0)
+    database["成本(万元)"] = database["价格"] / 10000
     database["维保响应"] = database["维保响应"].where(
         database["维保响应"].notna() & database["维保响应"].astype(str).str.strip().ne(""),
         "24小时",
@@ -332,7 +440,12 @@ def ensure_arm_database_columns(database):
     database.loc[database["瓶颈局限性"].str.strip().eq(""), "瓶颈局限性"] = database.loc[
         database["瓶颈局限性"].str.strip().eq("")
     ].apply(describe_limitations, axis=1)
-    database["节拍秒数"] = pd.to_numeric(database["节拍秒数"], errors="coerce").fillna(20)
+    parsed_takt = pd.to_numeric(
+        database["节拍秒数"].map(parse_takt_to_seconds), errors="coerce"
+    )
+    if "_节拍有效" not in database.columns:
+        database["_节拍有效"] = parsed_takt.gt(0).fillna(False)
+    database["节拍秒数"] = parsed_takt.where(parsed_takt > 0).fillna(20)
 
     database["Pros"] = database["Pros"].fillna("").astype(str)
     database["Cons"] = database["Cons"].fillna("").astype(str)
@@ -439,14 +552,682 @@ def apply_model_to_station(model_row, station_name):
     )
     if station_item is None:
         return False
+    if "initial_production_line" not in st.session_state:
+        st.session_state["initial_production_line"] = snapshot_production_line()
     model_name = str(model_row.get("机型", model_row.get("品牌名称", "未知机型")))
     takt_value = float(model_row.get("节拍秒数", 20))
     if takt_value.is_integer():
         takt_value = int(takt_value)
     station_item["model"] = model_name
     station_item["takt"] = takt_value
+    # 新机型自带真实价格/占地/精度，清除旧的工位级缩放覆盖
+    for override_key in ("price", "reach", "precision"):
+        station_item.pop(override_key, None)
+    # 该工位机型被手动/AI 单点更换后，重置它的全局优化标记
+    station_flags = st.session_state.get("station_optimization_flags")
+    if isinstance(station_flags, dict):
+        station_flags.pop(station_name, None)
     sync_line_state()
+    st.session_state["optimization_applied"] = True
     return True
+
+
+GLOBAL_OPTIMIZATION_OPERATIONS = {
+    "全局提速": {
+        "key": "speed_up",
+        "metric": "节拍秒数",
+        "prefer": "min",
+        "label": "速度",
+        "success_message": "✅ 已成功为您将全线更换为高速机型。",
+        "repeat_message": "当前产线已完成全线提速，请勿重复执行。",
+    },
+    "全局降速": {
+        "key": "speed_down",
+        "metric": "节拍秒数",
+        "prefer": "max",
+        "label": "速度",
+        "success_message": "✅ 已成功为您将全线更换为低速机型。",
+        "repeat_message": "当前产线已完成全线降速，请勿重复执行。",
+    },
+    "全局提质": {
+        "key": "quality_up",
+        "metric": "精度(mm)",
+        "prefer": "min",
+        "label": "精度",
+        "success_message": "✅ 已成功为您将全线更换为高精度机型。",
+        "repeat_message": "当前产线已完成全线提质，请勿重复执行。",
+    },
+    "全局降质": {
+        "key": "quality_down",
+        "metric": "精度(mm)",
+        "prefer": "max",
+        "label": "精度",
+        "success_message": "✅ 已成功为您将全线更换为低精度机型。",
+        "repeat_message": "当前产线已完成全线降质，请勿重复执行。",
+    },
+    "全局降本": {
+        "key": "cost_down",
+        "metric": "价格",
+        "prefer": "min",
+        "label": "成本",
+        "success_message": "✅ 已成功为您将全线更换为低成本机型。",
+        "repeat_message": "当前产线已完成全线降本，请勿重复执行。",
+    },
+    "全局提价": {
+        "key": "cost_up",
+        "metric": "价格",
+        "prefer": "max",
+        "label": "成本",
+        "success_message": "✅ 已成功为您将全线更换为高成本机型。",
+        "repeat_message": "当前产线已完成全线提价，请勿重复执行。",
+    },
+    "全局省地": {
+        "key": "space_down",
+        "metric": "臂展半径",
+        "prefer": "min",
+        "label": "占地",
+        "success_message": "✅ 已成功为您将全线更换为紧凑型机型。",
+        "repeat_message": "当前产线已完成全线省地，请勿重复执行。",
+    },
+    "全局增地": {
+        "key": "space_up",
+        "metric": "臂展半径",
+        "prefer": "max",
+        "label": "占地",
+        "success_message": "✅ 已成功为您将全线更换为大空间机型。",
+        "repeat_message": "当前产线已完成全线增地，请勿重复执行。",
+    },
+}
+
+
+METRIC_VALIDITY_COLUMNS = {
+    "节拍秒数": "_节拍有效",
+    "精度(mm)": "_精度有效",
+    "价格": "_价格有效",
+    "臂展半径": "_臂展有效",
+}
+
+
+# 同一维度内先判断“降低/负向”词，再判断“提高/正向”词，避免语义误判
+GLOBAL_OPERATION_PATTERNS = {
+    "全局降速": (
+        r"(速度|节拍).{0,8}(降低|下降|变慢|减慢|放慢|调慢|减少|延长|变长)",
+        r"(降低|减低|下降|减慢|放慢|调慢|减少|延长).{0,8}(速度|节拍)",
+        r"降速|减速|变慢|放慢|调慢",
+    ),
+    "全局提速": (
+        r"(速度|节拍).{0,8}(提高|提升|加快|变快|调快|加速|增加|缩短|变短)",
+        r"(提高|提升|加快|变快|调快|加速|缩短).{0,8}(速度|节拍)",
+        r"提速|加快|变快|加速|调快",
+    ),
+    "全局降质": (
+        r"(质量|品质|精度).{0,8}(降低|下降|变差|减少|低)",
+        r"(降低|下降|减少).{0,8}(质量|品质|精度)",
+        r"降质|不要精度|精度变差|降低精度",
+    ),
+    "全局提质": (
+        r"(质量|品质|精度).{0,8}(提高|提升|变好|高|好)",
+        r"(提高|提升).{0,8}(质量|品质|精度)",
+        r"提质|高精度|提高质量|提高精度",
+    ),
+    "全局降本": (
+        r"(成本|价格).{0,8}(降低|下降|减少|低|便宜|省)",
+        r"(降低|下降|减少|省).{0,8}(成本|价格)",
+        r"降本|省钱|降价|降低成本",
+    ),
+    "全局提价": (
+        r"(成本|价格).{0,8}(增加|提高|提升|上涨|涨|高|贵)",
+        r"(增加|提高|提升).{0,8}(成本|价格)",
+        r"提价|涨价|增加成本",
+    ),
+    "全局省地": (
+        r"(占地|空间).{0,8}(缩小|减小|减少|降低|小|紧凑)",
+        r"(缩小|减小|减少|降低).{0,8}(占地|空间)",
+        r"省地|减小占地|减少空间",
+    ),
+    "全局增地": (
+        r"(占地|空间).{0,8}(变大|增大|增加|扩大|大)",
+        r"(增加|增大|扩大).{0,8}(占地|空间)",
+        r"增地|占地变大|增加空间|扩大空间",
+    ),
+}
+
+GLOBAL_DIMENSION_ORDER = (
+    ("全局降速", "全局提速"),
+    ("全局降质", "全局提质"),
+    ("全局降本", "全局提价"),
+    ("全局省地", "全局增地"),
+)
+
+_GLOBAL_CLAUSE_SPLIT_PATTERN = re.compile(
+    r"并且|而且|同时|还要|以及|并|且|[，,；;。、]|\s+"
+)
+
+
+def _clause_matches_operation(clause, operation):
+    if operation in clause:
+        return True
+    return any(
+        re.search(pattern, clause)
+        for pattern in GLOBAL_OPERATION_PATTERNS[operation]
+    )
+
+
+def detect_global_operations(text):
+    """从自然语言中提取全局指令，同一维度只保留一个方向。
+
+    先按标点/连接词拆分短句，再逐维度匹配，优先识别“降低”类语义，
+    避免“提高速度并降低成本”这类复合句中的方向串扰。
+    """
+    clauses = [
+        clause
+        for clause in _GLOBAL_CLAUSE_SPLIT_PATTERN.split(str(text or ""))
+        if clause.strip()
+    ]
+    operations = []
+    for down_operation, up_operation in GLOBAL_DIMENSION_ORDER:
+        matched = None
+        for clause in clauses:
+            if _clause_matches_operation(clause, down_operation):
+                matched = down_operation
+                break
+        if matched is None:
+            for clause in clauses:
+                if _clause_matches_operation(clause, up_operation):
+                    matched = up_operation
+                    break
+        if matched is not None:
+            operations.append(matched)
+    return operations
+
+
+def _normalized_metric_scores(candidates, metric_columns, preferences):
+    """按指标方向归一化打分，分数越高越优。"""
+    total = pd.Series(0.0, index=candidates.index)
+    for column in metric_columns:
+        values = candidates[f"_{column}"]
+        low = values.min()
+        high = values.max()
+        if high == low:
+            normalized = pd.Series(1.0, index=candidates.index)
+        elif preferences[column] == "max":
+            normalized = (values - low) / (high - low)
+        else:
+            normalized = (high - values) / (high - low)
+        total += normalized
+    return total / max(len(metric_columns), 1)
+
+
+def _select_compound_replacement(pool, current_values, operations):
+    """在给定的同品牌/同类型候选池中选择复合最优机型。
+
+    返回 ``(replacement_row, 是否发生冲突)``。找不到同时改善全部指标的
+    机型时返回 ``None``，由调用方按比例缩放参数。
+    """
+    if pool is None or pool.empty:
+        return None, True
+
+    metric_columns = list(
+        dict.fromkeys(
+            GLOBAL_OPTIMIZATION_OPERATIONS[operation]["metric"]
+            for operation in operations
+        )
+    )
+    preferences = {
+        GLOBAL_OPTIMIZATION_OPERATIONS[operation]["metric"]: (
+            GLOBAL_OPTIMIZATION_OPERATIONS[operation]["prefer"]
+        )
+        for operation in operations
+    }
+    candidates = pool.copy()
+    for column in metric_columns:
+        validity_column = METRIC_VALIDITY_COLUMNS.get(column)
+        if validity_column and validity_column in candidates.columns:
+            candidates = candidates[
+                candidates[validity_column].fillna(False)
+            ]
+    for column in metric_columns:
+        candidates[f"_{column}"] = pd.to_numeric(
+            candidates[column], errors="coerce"
+        )
+    candidates = candidates.dropna(
+        subset=[f"_{column}" for column in metric_columns]
+    )
+    if candidates.empty:
+        return None, True
+
+    improves_all = pd.Series(True, index=candidates.index)
+    for column in metric_columns:
+        current_value = current_values.get(column, float("nan"))
+        if pd.isna(current_value):
+            continue
+        if preferences[column] == "max":
+            improves_all &= candidates[f"_{column}"] > current_value
+        else:
+            improves_all &= candidates[f"_{column}"] < current_value
+
+    if not improves_all.any():
+        return None, True
+
+    good = candidates[improves_all].copy()
+    good["_score"] = _normalized_metric_scores(
+        good, metric_columns, preferences
+    )
+    return (
+        good.sort_values("_score", ascending=False, kind="stable").iloc[0],
+        False,
+    )
+
+
+GLOBAL_METRIC_OVERRIDE_KEYS = {
+    "价格": "price",
+    "臂展半径": "reach",
+    "精度(mm)": "precision",
+}
+
+
+def _effective_item_metric(item, model_row, metric):
+    """读取工位生效的指标值：优先使用工位级覆盖值，其次使用机型数据。"""
+    override_key = GLOBAL_METRIC_OVERRIDE_KEYS.get(metric)
+    if override_key and item.get(override_key) is not None:
+        try:
+            value = float(item[override_key])
+            if not pd.isna(value) and value > 0:
+                return value
+        except (TypeError, ValueError):
+            pass
+    if metric == "节拍秒数":
+        try:
+            value = float(item.get("takt"))
+            if not pd.isna(value) and value > 0:
+                return value
+        except (TypeError, ValueError):
+            pass
+    if model_row is not None:
+        value = normalize_numeric(
+            model_row.get(metric, float("nan")), default=float("nan")
+        )
+        if not pd.isna(value):
+            return float(value)
+    return float("nan")
+
+
+def _set_effective_item_metric(item, metric, value):
+    """把指标值写回工位；价格/占地/精度使用工位级覆盖，避免统一克隆。"""
+    if pd.isna(value) or value <= 0:
+        return
+    if metric == "节拍秒数":
+        item["takt"] = int(value) if float(value).is_integer() else float(value)
+        return
+    override_key = GLOBAL_METRIC_OVERRIDE_KEYS.get(metric)
+    if override_key:
+        item[override_key] = float(value)
+
+
+def _clear_item_metric_overrides(item):
+    for key in GLOBAL_METRIC_OVERRIDE_KEYS.values():
+        item.pop(key, None)
+
+
+def _station_candidate_pool(model_library, current_model, excluded_models):
+    """同品牌优先、找不到同品牌时退回同工序类型。"""
+    pool = model_library[
+        ~model_library["机型"].astype(str).isin(excluded_models)
+    ].copy()
+    if current_model is None:
+        return pool
+    brand = str(current_model.get("品牌名称", "") or "").strip()
+    process_type = str(current_model.get("工序类型", "") or "").strip()
+    if brand:
+        same_brand = pool[
+            pool["品牌名称"].astype(str).str.strip() == brand
+        ]
+        if not same_brand.empty:
+            return same_brand
+    if process_type:
+        same_type = pool[
+            pool["工序类型"].astype(str).str.strip() == process_type
+        ]
+        if not same_type.empty:
+            return same_type
+    return model_library.iloc[0:0].copy()
+
+
+def run_global_optimization(operations):
+    """统一的全局替换寻优入口，支持单一指令或复合指令。
+
+    ``operations`` 可以是字符串或字符串列表。返回
+    ``(状态, 提示消息, 额外警告或 None)``；状态为
+    ``"success"``（已替换）或 ``"warning"``（未找到匹配机型/无数据）。
+    """
+    if isinstance(operations, str):
+        operations = [operations]
+    operations = [
+        operation
+        for operation in operations
+        if operation in GLOBAL_OPTIMIZATION_OPERATIONS
+    ]
+    if not operations:
+        return "warning", "未知的全局优化指令。", None
+
+    production_line = st.session_state.get("production_line", [])
+    if not production_line:
+        return "warning", "当前产线没有可执行工位。", None
+    if "initial_production_line" not in st.session_state:
+        st.session_state["initial_production_line"] = snapshot_production_line()
+
+    database = st.session_state.get("arm_database")
+    model_library = pd.DataFrame()
+    known_model_names = set()
+    if isinstance(database, pd.DataFrame) and not database.empty:
+        model_library = ensure_arm_database_columns(database)
+        if not model_library.empty:
+            # 强制数值化：外部 CSV 可能包含 ±0.02mm、30万、1.2m 等格式
+            for column, parser, default in (
+                ("节拍秒数", parse_takt_to_seconds, 20.0),
+                ("精度(mm)", parse_precision_to_mm, 0.05),
+                ("价格", parse_price_to_yuan, 0.0),
+                ("臂展半径", parse_reach_to_mm, 800.0),
+            ):
+                model_library[column] = pd.to_numeric(
+                    model_library[column].map(parser), errors="coerce"
+                ).fillna(default)
+            model_library["占地估算(㎡)"] = (
+                model_library["臂展半径"] / 1000
+            ) ** 2 * 3.14
+            model_library["成本(万元)"] = model_library["价格"] / 10000
+            known_model_names = set(model_library["机型"].astype(str))
+
+    is_compound = len(operations) > 1
+    changed_count = 0
+    conflict_count = 0
+
+    # 当前已被占用的机型：避免多个工位被替换成完全相同的型号
+    used_models = {
+        str(item.get("model", "") or "").strip()
+        for item in production_line
+        if str(item.get("model", "") or "").strip()
+        not in {"", "未配置", "无可用机型"}
+    }
+
+    def lookup_model(model_name):
+        if model_library.empty or not model_name:
+            return None
+        rows = model_library[
+            model_library["机型"].astype(str) == model_name
+        ]
+        return rows.iloc[0] if not rows.empty else None
+
+    def usable_rows(pool):
+        if pool.empty:
+            return pool
+        validity_columns = [
+            column
+            for column in ("_价格有效", "_臂展有效", "_节拍有效")
+            if column in pool.columns
+        ]
+        if not validity_columns:
+            return pool
+        mask = pd.Series(True, index=pool.index)
+        for column in validity_columns:
+            mask &= pool[column].fillna(False)
+        usable = pool[mask]
+        return usable if not usable.empty else pool
+
+    def pick_default_row(station_name):
+        if model_library.empty:
+            return None
+        matched = usable_rows(
+            model_library[
+                model_library["工位"].astype(str).map(
+                    lambda label: normalize_station_label(label)
+                    == normalize_station_label(station_name)
+                )
+            ]
+        )
+        all_usable = usable_rows(model_library)
+        for pool in (matched, all_usable):
+            if pool.empty:
+                continue
+            unused = pool[~pool["机型"].astype(str).isin(used_models)]
+            if not unused.empty:
+                return unused.iloc[0]
+        return all_usable.iloc[0]
+
+    for item in production_line:
+        station_changed = False
+        model_name = str(item.get("model", "") or "").strip()
+        is_unbound = model_name in {"", "未配置", "无可用机型"} or (
+            bool(known_model_names) and model_name not in known_model_names
+        )
+        # 未绑定机械臂的工位分配一个未使用的默认机型，保证初始数据有差异
+        if is_unbound and not model_library.empty:
+            default_row = pick_default_row(str(item.get("name", "")).strip())
+            if default_row is not None:
+                model_name = str(default_row["机型"])
+                item["model"] = model_name
+                _clear_item_metric_overrides(item)
+                default_takt = float(default_row["节拍秒数"])
+                item["takt"] = (
+                    int(default_takt)
+                    if default_takt.is_integer()
+                    else default_takt
+                )
+                used_models.add(model_name)
+                station_changed = True
+
+        current_model = lookup_model(model_name)
+        replacement_row = None
+        if not model_library.empty and current_model is not None:
+            # 只在同品牌/同工序类型中寻找替代机型，且排除已被占用的型号
+            pool = _station_candidate_pool(
+                model_library,
+                current_model,
+                used_models | {model_name},
+            )
+
+            if is_compound:
+                current_values = {}
+                for operation in operations:
+                    column = GLOBAL_OPTIMIZATION_OPERATIONS[operation]["metric"]
+                    current_values[column] = _effective_item_metric(
+                        item, current_model, column
+                    )
+                replacement_row, has_conflict = _select_compound_replacement(
+                    pool, current_values, operations
+                )
+                if has_conflict:
+                    conflict_count += 1
+            else:
+                config = GLOBAL_OPTIMIZATION_OPERATIONS[operations[0]]
+                metric_column = config["metric"]
+                prefer = config["prefer"]
+                current_value = _effective_item_metric(
+                    item, current_model, metric_column
+                )
+                candidates = pool
+                validity_column = METRIC_VALIDITY_COLUMNS.get(metric_column)
+                if (
+                    validity_column
+                    and validity_column in candidates.columns
+                ):
+                    candidates = candidates[
+                        candidates[validity_column].fillna(False)
+                    ]
+                candidates["_metric"] = pd.to_numeric(
+                    candidates[metric_column], errors="coerce"
+                )
+                candidates = candidates[candidates["_metric"].notna()]
+                if not candidates.empty:
+                    if pd.isna(current_value):
+                        replacement_row = candidates.sort_values(
+                            "_metric",
+                            ascending=(prefer == "min"),
+                            kind="stable",
+                        ).iloc[0]
+                    elif prefer == "min":
+                        better = candidates[
+                            candidates["_metric"] < current_value
+                        ]
+                        if not better.empty:
+                            replacement_row = better.sort_values(
+                                "_metric", ascending=True, kind="stable"
+                            ).iloc[0]
+                    else:
+                        better = candidates[
+                            candidates["_metric"] > current_value
+                        ]
+                        if not better.empty:
+                            replacement_row = better.sort_values(
+                                "_metric", ascending=False, kind="stable"
+                            ).iloc[0]
+
+        if replacement_row is not None:
+            replacement_takt = float(replacement_row["节拍秒数"])
+            item["model"] = str(replacement_row["机型"])
+            item["takt"] = (
+                int(replacement_takt)
+                if replacement_takt.is_integer()
+                else replacement_takt
+            )
+            _clear_item_metric_overrides(item)
+            used_models.add(str(replacement_row["机型"]))
+            station_changed = True
+        elif not model_library.empty and current_model is not None:
+            # 同品牌/同类型中没有合适替代机型：按比例缩放当前参数
+            for operation in operations:
+                config = GLOBAL_OPTIMIZATION_OPERATIONS[operation]
+                metric_column = config["metric"]
+                current_value = _effective_item_metric(
+                    item, current_model, metric_column
+                )
+                if pd.isna(current_value) or current_value <= 0:
+                    continue
+                factor = 0.8 if config["prefer"] == "min" else 1.2
+                _set_effective_item_metric(
+                    item, metric_column, current_value * factor
+                )
+                station_changed = True
+
+        if station_changed:
+            changed_count += 1
+
+    # 最终差异化保障：成本/占地柱子不能全部雷同
+    used_costs = set()
+    used_areas = set()
+    for item in production_line:
+        model_name = str(item.get("model", "") or "").strip()
+        model_row = lookup_model(model_name)
+        price = _effective_item_metric(item, model_row, "价格")
+        reach = _effective_item_metric(item, model_row, "臂展半径")
+
+        if not pd.isna(price) and price > 0:
+            cost_key = round(price / 10000, 2)
+            adjusted = False
+            while cost_key in used_costs:
+                price *= 0.99
+                cost_key = round(price / 10000, 2)
+                adjusted = True
+            if adjusted:
+                item["price"] = price
+            used_costs.add(cost_key)
+
+        if not pd.isna(reach) and reach > 0:
+            area_key = round((reach / 1000) ** 2 * 3.14, 2)
+            adjusted = False
+            while area_key in used_areas:
+                reach *= 0.99
+                area_key = round((reach / 1000) ** 2 * 3.14, 2)
+                adjusted = True
+            if adjusted:
+                item["reach"] = reach
+            used_areas.add(area_key)
+
+    sync_line_state()
+    st.session_state["optimization_applied"] = True
+
+    if changed_count == 0:
+        return (
+            "warning",
+            "⚠️ 未在当前数据库中找到符合要求的机型，产线未改变。",
+            None,
+        )
+
+    if is_compound:
+        labels = "、".join(
+            GLOBAL_OPTIMIZATION_OPERATIONS[operation]["label"]
+            for operation in operations
+        )
+        if set(operations) == {"全局提速", "全局降本"}:
+            message = (
+                "✅ 已为您综合权衡成本与速度，"
+                "并按各工位差异完成参数优化。"
+            )
+            warning = (
+                "⚠️ 部分工位在同品牌/同类型中暂无同时满足全部要求的机型，"
+                "已按比例调整相应参数。"
+            ) if conflict_count else None
+        else:
+            message = (
+                f"✅ 已为您综合权衡{labels}，"
+                "并按各工位差异完成参数优化。"
+            )
+            warning = (
+                "⚠️ 部分工位在同品牌/同类型中暂无完全匹配的机型，"
+                "已按比例调整相应参数。"
+            ) if conflict_count else None
+        return "success", message, warning
+
+    return (
+        "success",
+        GLOBAL_OPTIMIZATION_OPERATIONS[operations[0]]["success_message"],
+        None,
+    )
+
+
+def comprehensive_model_scores(
+    candidates,
+    precision_weight,
+    speed_weight,
+    cost_weight,
+    space_weight,
+):
+    candidates = ensure_arm_database_columns(candidates).reset_index(drop=True).copy()
+    if candidates.empty:
+        return candidates, pd.Series(dtype=float)
+
+    score_columns = {}
+    for name, column in (
+        ("precision", "精度(mm)"),
+        ("speed", "节拍秒数"),
+        ("cost", "成本(万元)"),
+        ("space", "占地估算(㎡)"),
+    ):
+        values = pd.to_numeric(candidates[column], errors="coerce")
+        values = values.fillna(values.max() if values.notna().any() else 0)
+        score_columns[name] = 1 - values.rank(method="average", pct=True)
+
+    scores = pd.DataFrame(score_columns, index=candidates.index)
+    weights = {
+        "precision": precision_weight,
+        "speed": speed_weight,
+        "cost": cost_weight,
+        "space": space_weight,
+    }
+    return candidates, sum(scores[name] * weight for name, weight in weights.items())
+
+
+def format_exception_detail(error, api_key=""):
+    """格式化异常信息，附带底层原因并隐藏 API Key。"""
+    detail = str(error) or repr(error)
+    cause = error.__cause__ or error.__context__
+    if cause is not None:
+        cause_detail = str(cause) or repr(cause)
+        if cause_detail and cause_detail not in detail:
+            detail = f"{detail}（底层原因：{type(cause).__name__}: {cause_detail}）"
+    if api_key:
+        detail = detail.replace(api_key, "[API Key 已隐藏]")
+    return re.sub(r"sk-[A-Za-z0-9_-]+", "[API Key 已隐藏]", detail)
 
 
 def recommend_arm_model(candidates, scenario, station_name, requirements, api_key):
@@ -483,6 +1264,7 @@ def recommend_arm_model(candidates, scenario, station_name, requirements, api_ke
     if not api_key:
         return local_model.to_dict(), local_reason, "本地规则（未配置 API Key）"
 
+    st.session_state.pop("ai_last_error", None)
     try:
         from openai import OpenAI
 
@@ -493,6 +1275,15 @@ def recommend_arm_model(candidates, scenario, station_name, requirements, api_ke
             ]
         ].to_dict(orient="records")
         client = OpenAI(api_key=api_key, base_url="https://api.deepseek.com", timeout=25)
+        st.info(
+            "正在向 https://api.deepseek.com/chat/completions 发起真实请求"
+            f"（model=deepseek-chat，API Key 长度 {len(api_key)}）..."
+        )
+        print(
+            f"[AI 调试] 推荐请求 https://api.deepseek.com/chat/completions "
+            f"model=deepseek-chat key_length={len(api_key)}",
+            flush=True,
+        )
         response = client.chat.completions.create(
             model="deepseek-chat",
             messages=[
@@ -519,6 +1310,17 @@ def recommend_arm_model(candidates, scenario, station_name, requirements, api_ke
             ],
             response_format={"type": "json_object"},
         )
+        usage = getattr(response, "usage", None)
+        total_tokens = getattr(usage, "total_tokens", "未知")
+        st.success(
+            f"DeepSeek 响应成功！model={getattr(response, 'model', 'deepseek-chat')}，"
+            f"本次消耗 tokens={total_tokens}"
+        )
+        print(
+            f"[AI 调试] 推荐响应成功 model={getattr(response, 'model', 'deepseek-chat')} "
+            f"tokens={total_tokens}",
+            flush=True,
+        )
         result = json.loads(response.choices[0].message.content)
         model_name = str(result.get("model", "")).strip()
         matched = candidates[candidates["机型"].astype(str) == model_name]
@@ -526,7 +1328,10 @@ def recommend_arm_model(candidates, scenario, station_name, requirements, api_ke
         if matched.empty:
             return local_model.to_dict(), local_reason, "本地规则（AI 返回了候选库外机型）"
         return matched.iloc[0].to_dict(), reason, "DeepSeek AI"
-    except Exception:
+    except Exception as error:
+        st.session_state["ai_last_error"] = (
+            f"{type(error).__name__}: {format_exception_detail(error, api_key)}"
+        )
         return local_model.to_dict(), local_reason, "本地规则（AI 服务暂不可用）"
 
 
@@ -537,6 +1342,20 @@ def sync_line_state():
     st.session_state["current_station_models"] = {
         item["name"]: item["model"] for item in st.session_state["production_line"]
     }
+
+
+def snapshot_production_line():
+    return [
+        {"name": item["name"], "model": item.get("model", "未配置"), "takt": item["takt"]}
+        for item in st.session_state.get("production_line", [])
+    ]
+
+
+def reset_optimization_baseline():
+    st.session_state["initial_production_line"] = snapshot_production_line()
+    st.session_state["optimization_applied"] = False
+    # 产线结构/模板发生变化后，清空各工位的已优化状态
+    st.session_state["station_optimization_flags"] = {}
 
 
 def normalize_station_label(value):
@@ -616,6 +1435,22 @@ def extract_selected_station_from_event(event):
     return None
 
 
+def switch_selected_station(station):
+    """切换当前工位。
+
+    只应在控件回调（on_click / on_change）中调用：回调在脚本重新执行前运行，
+    此时 ``arm_recommend_station`` 控件尚未实例化，可以安全写入其 session_state，
+    不会触发 StreamlitWidgetAlreadyInstantiatedError。
+    """
+    if not station:
+        return
+    station_takts = st.session_state.get("current_station_takts", {})
+    if station_takts and station not in station_takts:
+        return
+    st.session_state["selected_ws"] = station
+    st.session_state["arm_recommend_station"] = station
+
+
 def build_production_line_template_csv():
     template_df = pd.DataFrame(
         [
@@ -665,42 +1500,111 @@ def load_existing_production_line(uploaded_file):
                 return available_cols[normalized]
         return None
 
-    order_col = resolve_column("工位顺序(数字)", "工位顺序", "工位顺序（数字）", "工位序号")
     name_col = resolve_column("工位名称", "工位名", "工位")
+    if name_col is None:
+        raise ValueError("CSV 必须包含“工位名称”列。")
+
+    # 工位顺序、当前机型、节拍秒数均为可选列：只填工位名称时也能导入
+    order_col = resolve_column("工位顺序(数字)", "工位顺序", "工位顺序（数字）", "工位序号")
     model_col = resolve_column("当前机型", "机型")
     takt_col = resolve_column("节拍秒数", "节拍", "节拍(秒)", "节拍秒")
 
-    if not all([order_col, name_col, model_col, takt_col]):
-        required_columns = ["工位顺序(数字)", "工位名称", "当前机型", "节拍秒数"]
-        raise ValueError(f"CSV 必须包含以下列：{', '.join(required_columns)}")
+    selected_columns = [name_col]
+    if order_col:
+        selected_columns.append(order_col)
+    if model_col:
+        selected_columns.append(model_col)
+    if takt_col:
+        selected_columns.append(takt_col)
+    cleaned = database[selected_columns].copy()
 
-    cleaned = database[[order_col, name_col, model_col, takt_col]].copy()
-    cleaned[order_col] = pd.to_numeric(cleaned[order_col], errors="coerce")
-    cleaned[takt_col] = pd.to_numeric(cleaned[takt_col], errors="coerce")
-    cleaned = cleaned.dropna(subset=[order_col, name_col, takt_col]).copy()
-    cleaned[name_col] = cleaned[name_col].astype(str).str.strip()
+    cleaned[name_col] = cleaned[name_col].map(
+        lambda value: "" if pd.isna(value) else str(value).strip()
+    )
     cleaned = cleaned[cleaned[name_col] != ""].copy()
-    cleaned = cleaned.sort_values(order_col, ascending=True, kind="mergesort").reset_index(drop=True)
+
+    if order_col:
+        cleaned[order_col] = pd.to_numeric(cleaned[order_col], errors="coerce")
+        cleaned = cleaned.dropna(subset=[order_col])
+        cleaned = cleaned.sort_values(
+            order_col, ascending=True, kind="mergesort"
+        )
+    cleaned = cleaned.reset_index(drop=True)
+
+    if takt_col:
+        cleaned[takt_col] = cleaned[takt_col].map(
+            lambda value: normalize_numeric(value, default=float("nan"))
+        )
 
     if cleaned.empty:
         raise ValueError("CSV 中没有有效的工位结构数据。")
 
-    if cleaned[order_col].duplicated().any():
+    if order_col and cleaned[order_col].duplicated().any():
         raise ValueError("工位顺序列中不能重复。")
 
-    production_line = []
-    for _, row in cleaned.iterrows():
-        model_value = row[model_col]
-        takt_value = float(row[takt_col])
-        if pd.isna(takt_value) or takt_value <= 0:
-            raise ValueError("节拍秒数必须是大于 0 的数字。")
+    # 当前机械臂库：用于给未指定/无效机型的工位自动补全默认机型
+    database_library = st.session_state.get("arm_database")
+    if isinstance(database_library, pd.DataFrame) and not database_library.empty:
+        model_library = ensure_arm_database_columns(database_library)
+    else:
+        model_library = pd.DataFrame()
 
+    def pick_default_model(station_name):
+        if model_library.empty:
+            return None
+        matched = model_library[
+            model_library["工位"].astype(str).map(
+                lambda label: normalize_station_label(label)
+                == normalize_station_label(station_name)
+            )
+        ]
+        if not matched.empty:
+            return matched.iloc[0]
+        return model_library.iloc[0]
+
+    production_line = []
+    auto_assigned_count = 0
+    for _, row in cleaned.iterrows():
+        station_name = str(row[name_col]).strip()
+
+        raw_model = row[model_col] if model_col else None
+        model_name = (
+            "未配置"
+            if raw_model is None or pd.isna(raw_model) or str(raw_model).strip() == ""
+            else str(raw_model).strip()
+        )
+
+        raw_takt = row[takt_col] if takt_col else None
+        takt_value = None
+        if raw_takt is not None and not pd.isna(raw_takt) and float(raw_takt) > 0:
+            takt_value = float(raw_takt)
+
+        # 指定机型必须真实存在于当前机械臂库中
+        matched_model = None
+        if model_name != "未配置" and not model_library.empty:
+            model_rows = model_library[model_library["机型"].astype(str) == model_name]
+            if not model_rows.empty:
+                matched_model = model_rows.iloc[0]
+
+        auto_assigned = False
+        if matched_model is None:
+            matched_model = pick_default_model(station_name)
+            if matched_model is not None:
+                model_name = str(matched_model["机型"])
+                auto_assigned = True
+                auto_assigned_count += 1
+            elif model_name != "未配置":
+                model_name = "未配置"
+
+        # 自动补全的工位按所分配机型的节拍重新计算；仅缺节拍时也取机型节拍
+        if matched_model is not None and (auto_assigned or takt_value is None):
+            takt_value = float(matched_model["节拍秒数"])
+        if takt_value is None or takt_value <= 0:
+            takt_value = 20.0
+
+        takt_value = int(takt_value) if takt_value.is_integer() else takt_value
         production_line.append(
-            {
-                "name": str(row[name_col]).strip(),
-                "model": "未配置" if pd.isna(model_value) or str(model_value).strip() == "" else str(model_value).strip(),
-                "takt": int(takt_value) if float(takt_value).is_integer() else float(takt_value),
-            }
+            {"name": station_name, "model": model_name, "takt": takt_value}
         )
 
     if len({item["name"] for item in production_line}) != len(production_line):
@@ -708,7 +1612,8 @@ def load_existing_production_line(uploaded_file):
 
     st.session_state["production_line"] = production_line
     sync_line_state()
-    return production_line
+    reset_optimization_baseline()
+    return production_line, auto_assigned_count
 
 
 # 初始化各工位的占位节拍和已采用机型
@@ -739,6 +1644,7 @@ def apply_industry_template(template_name):
         for item in template["production_line"]
     ]
     sync_line_state()
+    reset_optimization_baseline()
     st.session_state.setdefault("arm_filter_submitted", False)
     st.session_state.setdefault("arm_filter_conditions", None)
 
@@ -786,6 +1692,8 @@ if "production_line" not in st.session_state:
     apply_industry_template(st.session_state["industry_template"])
 
 sync_line_state()
+st.session_state.setdefault("initial_production_line", snapshot_production_line())
+st.session_state.setdefault("optimization_applied", False)
 st.session_state.setdefault("target_capacity", 100)
 st.session_state.setdefault("ai_parsed_result", None)
 st.session_state.setdefault("ai_parse_mode", None)
@@ -808,6 +1716,7 @@ if pending_station_add is not None:
         st.session_state["production_line"].insert(insert_index, station_record)
         st.session_state["line_edit_notice"] = f"已添加工位：{pending_station_add['name']}"
         st.session_state["new_station_name"] = ""
+        reset_optimization_baseline()
     else:
         st.session_state["line_edit_notice"] = f"工位“{pending_station_add['name']}”已存在"
     sync_line_state()
@@ -821,6 +1730,7 @@ if pending_station_delete is not None:
     ]
     if len(st.session_state["production_line"]) < before_count:
         st.session_state["line_edit_notice"] = f"已删除工位：{pending_station_delete}"
+        reset_optimization_baseline()
     sync_line_state()
 
 line_station_names = list(st.session_state["current_station_takts"])
@@ -854,19 +1764,54 @@ else:
 pending_ai_apply = st.session_state.pop("ai_pending_apply", None)
 if pending_ai_apply is not None:
     station = pending_ai_apply["station"]
-    station_item = next(
-        (item for item in st.session_state["production_line"] if item["name"] == station),
-        None,
-    )
-    if station_item is not None:
-        station_item["model"] = pending_ai_apply["model"]
-        station_item["takt"] = pending_ai_apply["takt"]
-        st.session_state["target_capacity"] = pending_ai_apply["target_capacity"]
-        st.session_state["ai_apply_notice"] = (
-            f"已更新 {station}：采用 {pending_ai_apply['model']}，"
-            f"目标产能 {pending_ai_apply['target_capacity']:g} 件/小时。"
+    if station == "全部":
+        operations = pending_ai_apply.get("operation", "全局提速")
+        try:
+            status, message, warning = run_global_optimization(operations)
+        except Exception as error:
+            traceback.print_exc()
+            status, message, warning = (
+                "warning",
+                f"⚠️ 替换执行失败：{type(error).__name__}: {error}",
+                None,
+            )
+        if status == "success":
+            st.session_state["ai_apply_notice"] = message
+            if warning:
+                st.session_state["ai_apply_warning"] = warning
+        else:
+            # 找不到匹配机型/数据异常时用黄色警告，绝不静默失败
+            st.session_state["ai_apply_warning"] = message
+    else:
+        station_item = next(
+            (item for item in st.session_state["production_line"] if item["name"] == station),
+            None,
         )
-        sync_line_state()
+        if station_item is not None:
+            apply_model_to_station(
+                {"机型": pending_ai_apply["model"], "节拍秒数": pending_ai_apply["takt"]},
+                station,
+            )
+            # 目标产能只作为需求指标展示，绝不回写/改变当前产线节拍或机型
+            target_capacity_value = normalize_numeric(
+                pending_ai_apply.get("target_capacity", 0)
+            )
+            if target_capacity_value > 0:
+                st.session_state["ai_apply_notice"] = (
+                    f"已更新 {station}：采用 {pending_ai_apply['model']}，"
+                    f"目标产能 {format_display_number(target_capacity_value, 1)} 件/小时。"
+                )
+            else:
+                st.session_state["ai_apply_notice"] = (
+                    f"已更新 {station}：采用 {pending_ai_apply['model']}。"
+                )
+        else:
+            # 不能静默忽略：目标工位可能已被删除或重命名
+            st.session_state["ai_apply_error"] = (
+                f"未找到工位“{station}”，AI 方案未执行，请刷新产线结构后重试。"
+            )
+    # 数据更新完成，强制重新加载页面，避免前端复用旧节点导致 removeChild 崩溃
+    st.rerun()
 
 # 内置机械臂数据：保留兼容旧字段，并补齐最终要求的三级联动字段
 required_arm_columns = [
@@ -883,6 +1828,7 @@ required_arm_columns = [
     "是否支持视觉",
     "IP防护",
     "运行速度",
+    "运行速度(m/s)",
     "通讯接口",
     "耐用性",
     "核心特点",
@@ -890,6 +1836,8 @@ required_arm_columns = [
     "价格",
     "维保响应",
     "节拍秒数",
+    "占地估算(㎡)",
+    "成本(万元)",
 ]
 default_arm_rows = [
     {
@@ -1067,39 +2015,127 @@ def resolve_line_station(requested_station, station_options):
     raise ValueError("AI 返回的工位不在当前产线中")
 
 
+def is_global_speed_request(text):
+    global_terms = (
+        "整体",
+        "整线",
+        "整条",
+        "全部工位",
+        "所有工位",
+        "全线",
+        "全产线",
+        "整条产线",
+    )
+    speed_terms = (
+        "提速",
+        "调快",
+        "加快",
+        "变快",
+        "加速",
+        "缩短节拍",
+        "提高速度",
+        "提升速度",
+    )
+    return any(term in text for term in global_terms) and any(
+        term in text for term in speed_terms
+    )
+
+
+KNOWN_ORIGINS = (
+    "中国",
+    "日本",
+    "德国",
+    "美国",
+    "瑞士",
+    "瑞典",
+    "韩国",
+    "法国",
+    "意大利",
+    "英国",
+    "加拿大",
+    "奥地利",
+    "西班牙",
+)
+
+
+def _is_origin_requirement(requirement):
+    return any(
+        origin in str(requirement) for origin in KNOWN_ORIGINS
+    )
+
+
 def rule_based_parse(text):
+    global_terms = (
+        "整条",
+        "整线",
+        "全线",
+        "整体",
+        "全产线",
+        "整条产线",
+        "全部工位",
+        "所有工位",
+    )
+    quality_terms = ("质量", "品质", "良率")
+    station_options = list(
+        st.session_state.get("current_station_takts", initial_station_takts)
+    )
+    mentions_quality = any(term in text for term in quality_terms)
+
+    # 统一从关键词库提取全局要求，支持同一维度的“提升/降低”双向操作
+    global_requirements = detect_global_operations(text)
+
+    explicit_station = any(
+        str(name).strip() and str(name).lower() in text.lower()
+        for name in station_options
+    )
+    has_global_scope = (
+        any(term in text for term in global_terms)
+        or "产线" in text
+        # 只要命中全局优化关键词且未点名具体工位，一律强制按整线处理
+        or (bool(global_requirements) and not explicit_station)
+    )
+
+    # 命中全局指令时，返回完整的要求列表（支持复合指令）
+    if has_global_scope and global_requirements:
+        return {
+            "工位": "全部",
+            "要求": global_requirements,
+            "目标产能": 0,
+        }
+
     requirements = []
     if "国产" in text:
         requirements.append("国产")
     elif "进口" in text:
         requirements.append("进口")
-    if "高精度" in text:
+    if "高精度" in text or mentions_quality:
+        # 质量/品质/良率统一映射为精度要求（高精度）
         requirements.append("高精度")
 
-    for origin in ("日本", "德国", "中国", "美国", "韩国", "法国"):
+    for origin in KNOWN_ORIGINS:
         if origin in text and origin not in requirements:
             requirements.append(origin)
-
-    station_options = list(
-        st.session_state.get("current_station_takts", initial_station_takts)
-    )
     if not station_options:
         raise ValueError("当前产线没有可用工位")
 
-    station = next(
-        (name for name in station_options if str(name).lower() in text.lower()),
-        None,
-    )
-    if station is None:
-        station_match = re.search(r"([A-Za-z])\s*(?:工位|工序)", text)
-        if station_match:
-            try:
-                station = resolve_line_station(station_match.group(1), station_options)
-            except ValueError:
-                station = None
-    if station is None:
-        selected_station = st.session_state.get("filter_station")
-        station = selected_station if selected_station in station_options else station_options[0]
+    # 识别到“整条/全线”等全局范围词时，强制工位输出为“全部”
+    if has_global_scope or is_global_speed_request(text):
+        station = "全部"
+    else:
+        station = next(
+            (name for name in station_options if str(name).lower() in text.lower()),
+            None,
+        )
+        if station is None:
+            station_match = re.search(r"([A-Za-z])\s*(?:工位|工序)", text)
+            if station_match:
+                try:
+                    station = resolve_line_station(station_match.group(1), station_options)
+                except ValueError:
+                    station = None
+        if station is None:
+            selected_station = st.session_state.get("filter_station")
+            station = selected_station if selected_station in station_options else station_options[0]
 
     capacity_match = re.search(
         r"(?:目标)?产能\s*(?:调整到|提高到|设为|为|[:：=])?\s*(\d+(?:\.\d+)?)",
@@ -1114,11 +2150,17 @@ def rule_based_parse(text):
         capacity_match = re.search(r"\d+(?:\.\d+)?", text)
 
     if capacity_match is not None:
-        target_capacity = float(capacity_match.group(1) if capacity_match.lastindex else capacity_match.group())
+        target_capacity = float(
+            capacity_match.group(1)
+            if capacity_match.lastindex
+            else capacity_match.group()
+        )
+        if target_capacity <= 0:
+            target_capacity = 0.0
     else:
-        target_capacity = float(st.session_state.get("target_capacity", 100))
-    if target_capacity <= 0:
-        target_capacity = float(st.session_state.get("target_capacity", 100))
+        # 未在描述中明确目标产能时，不读取右上角输入框，
+        # 确保目标产能只用于对比提示，不影响选型与产线数据
+        target_capacity = 0.0
 
     return {
         "工位": station,
@@ -1127,60 +2169,92 @@ def rule_based_parse(text):
     }
 
 
+def _filter_candidates_by_requirements(candidates, requirements):
+    filtered = candidates.copy()
+    for requirement in requirements:
+        requirement_text = str(requirement)
+        if "国产" in requirement_text:
+            filtered = filtered[filtered["产地"].map(is_domestic)]
+        elif "进口" in requirement_text:
+            filtered = filtered[~filtered["产地"].map(is_domestic)]
+        elif "高精度" in requirement_text or "精度高" in requirement_text:
+            precision = filtered["精度"].map(parse_first_number)
+            filtered = filtered[precision.notna() & (precision <= 0.02)]
+        elif "精度" in requirement_text:
+            precision_limit = parse_first_number(requirement_text)
+            if precision_limit is None:
+                return filtered.iloc[0:0]
+            precision = filtered["精度"].map(parse_first_number)
+            filtered = filtered[
+                precision.notna() & (precision <= precision_limit)
+            ]
+        elif "维保" in requirement_text or "响应" in requirement_text:
+            maintenance_limit = parse_maintenance_hours(requirement_text)
+            if maintenance_limit is None:
+                return filtered.iloc[0:0]
+            maintenance = filtered["维保响应"].map(parse_maintenance_hours)
+            filtered = filtered[
+                maintenance.notna() & (maintenance <= maintenance_limit)
+            ]
+        elif "价格" in requirement_text or "预算" in requirement_text:
+            price_limit = parse_first_number(requirement_text)
+            if price_limit is None:
+                return filtered.iloc[0:0]
+            prices = pd.to_numeric(filtered["价格"], errors="coerce")
+            filtered = filtered[prices.notna() & (prices <= price_limit)]
+        else:
+            origins = (
+                filtered["产地"].fillna("").astype(str)
+                + " "
+                + filtered["品牌产地"].fillna("").astype(str)
+            )
+            filtered = filtered[
+                origins.str.contains(
+                    re.escape(requirement_text), case=False, regex=True
+                )
+            ]
+        if filtered.empty:
+            return filtered
+    return filtered
+
+
 def choose_model_for_ai(database, ai_result, station_options):
     station = resolve_line_station(ai_result["工位"], station_options)
-    target_capacity = float(ai_result["目标产能"])
-    if target_capacity <= 0:
-        raise ValueError("目标产能必须大于 0")
+    # 目标产能为 0 表示用户未指定，仅按其它条件选型，不作为硬约束
+    target_capacity = max(
+        normalize_numeric(ai_result.get("目标产能", 0)), 0.0
+    )
+    requirements = [
+        str(requirement).strip()
+        for requirement in ai_result.get("要求", [])
+        if str(requirement).strip()
+    ]
 
-    candidates = database[database["工位"] == station].copy()
-    requirements = [str(requirement).strip() for requirement in ai_result["要求"]]
-    for requirement in requirements:
-        if "国产" in requirement:
-            candidates = candidates[candidates["产地"].map(is_domestic)]
-        elif "进口" in requirement:
-            candidates = candidates[~candidates["产地"].map(is_domestic)]
-        elif "高精度" in requirement or "精度高" in requirement:
-            precision = candidates["精度"].map(parse_first_number)
-            candidates = candidates[precision.notna() & (precision <= 0.02)]
-        elif "精度" in requirement:
-            precision_limit = parse_first_number(requirement)
-            if precision_limit is None:
-                raise ValueError(f"无法识别精度要求：{requirement}")
-            precision = candidates["精度"].map(parse_first_number)
-            candidates = candidates[precision.notna() & (precision <= precision_limit)]
-        elif "维保" in requirement or "响应" in requirement:
-            maintenance_limit = parse_maintenance_hours(requirement)
-            if maintenance_limit is None:
-                raise ValueError(f"无法识别维保要求：{requirement}")
-            maintenance = candidates["维保响应"].map(parse_maintenance_hours)
-            candidates = candidates[maintenance.notna() & (maintenance <= maintenance_limit)]
-        elif "价格" in requirement or "预算" in requirement:
-            price_limit = parse_first_number(requirement)
-            if price_limit is None:
-                raise ValueError(f"无法识别价格要求：{requirement}")
-            prices = pd.to_numeric(candidates["价格"], errors="coerce")
-            candidates = candidates[prices.notna() & (prices <= price_limit)]
-        else:
-            origins = candidates["产地"].fillna("").astype(str)
-            candidates = candidates[
-                origins.str.contains(re.escape(requirement), case=False, regex=True)
-            ]
+    station_candidates = database[database["工位"] == station].copy()
+    candidates = _filter_candidates_by_requirements(
+        station_candidates, requirements
+    )
 
-        if candidates.empty:
-            raise ValueError(f"未找到符合“{requirement}”要求的机械臂")
+    # 产地类要求允许跨工位在整库中强制匹配（例如“改为瑞士的”）
+    if candidates.empty and any(
+        _is_origin_requirement(requirement) for requirement in requirements
+    ):
+        candidates = _filter_candidates_by_requirements(
+            database.copy(), requirements
+        )
 
-    max_station_takt = 3600 / target_capacity
-    candidates = candidates[candidates["节拍秒数"] <= max_station_takt]
+    if target_capacity > 0 and not candidates.empty:
+        capacity_candidates = candidates[
+            candidates["节拍秒数"] <= 3600 / target_capacity
+        ]
+        if not capacity_candidates.empty:
+            candidates = capacity_candidates
+
     if candidates.empty:
-        if requirements:
-            raise ValueError(
-                f"未找到符合“{requirements[-1]}”要求及目标产能的机械臂"
-            )
-        raise ValueError("未找到符合目标产能要求的机械臂")
+        return station, None, target_capacity, "库中无符合条件的机型"
 
     selected_model = candidates.sort_values("节拍秒数", kind="stable").iloc[0]
-    return station, selected_model, target_capacity
+    return station, selected_model, target_capacity, None
 
 
 # AI 提供方配置放在侧边栏，并统一写入会话状态
@@ -1202,7 +2276,16 @@ def safe_get_secret(secret_name):
             value = getattr(secrets, secret_name)
         else:
             value = ""
-    except Exception:
+    except StreamlitSecretNotFoundError:
+        # 未创建 secrets.toml 属于正常情况，不是需要上报的错误
+        return ""
+    except Exception as error:
+        # 其他异常不能静默吞掉，至少写入服务端日志便于排查
+        print(
+            f"[配置] 读取 secrets 失败: {type(error).__name__}: {error}",
+            flush=True,
+        )
+        traceback.print_exc()
         return ""
     if value is None:
         return ""
@@ -1226,16 +2309,32 @@ with st.sidebar:
         if import_signature != st.session_state.get("last_imported_line_signature"):
             st.session_state["last_imported_line_signature"] = import_signature
             try:
-                imported_line = load_existing_production_line(uploaded_line_structure)
+                imported_line, auto_assigned_count = load_existing_production_line(
+                    uploaded_line_structure
+                )
                 template_name = uploaded_line_structure.name.rsplit(".", 1)[0].strip()
                 if template_name in INDUSTRY_TEMPLATES:
                     template_name = f"{template_name}（导入）"
                 save_current_custom_template(template_name)
                 st.session_state["industry_template"] = template_name
                 st.session_state["industry_template_selection"] = template_name
-                st.success(f"已导入并选中模板“{template_name}”，共更新 {len(imported_line)} 个工位。")
+                if auto_assigned_count:
+                    st.session_state["line_import_notice"] = (
+                        f"已导入 {len(imported_line)} 个工位，"
+                        "系统已自动为您分配默认机械臂作为初始状态。"
+                    )
+                else:
+                    st.session_state["line_import_notice"] = (
+                        f"已导入并选中模板“{template_name}”，"
+                        f"共更新 {len(imported_line)} 个工位。"
+                    )
+                # 机型/节拍/成本/占地已初始化完成，强制重新加载页面刷新图表
+                st.rerun()
             except ValueError as error:
                 st.error(f"产线结构导入失败：{error}")
+
+    if "line_import_notice" in st.session_state:
+        st.success(st.session_state.pop("line_import_notice"))
 
     template_options = [
         *INDUSTRY_TEMPLATES.keys(),
@@ -1292,7 +2391,7 @@ with st.sidebar:
             "provider": ai_provider,
             "base_url": "https://api.deepseek.com",
             "api_key": provider_api_key,
-            "model": "deepseek-flash",
+            "model": "deepseek-chat",
         }
         if provider_api_key:
             st.caption("已读取可用 DeepSeek Key，当前将优先使用此凭证。")
@@ -1343,7 +2442,43 @@ with capacity_col:
 with ai_col:
     ai_enabled = st.toggle("AI 辅助", value=False, key="ai_enabled")
 
+# 目标产能只用于达标校验，绝不参与实际产线节拍或机型计算
+target_capacity_value = normalize_numeric(st.session_state.get("target_capacity", 0))
+line_takts_for_check = st.session_state.get("current_station_takts", {})
+if target_capacity_value > 0 and line_takts_for_check:
+    actual_capacity_value = 3600 / max(
+        float(takt) for takt in line_takts_for_check.values()
+    )
+    if actual_capacity_value < target_capacity_value:
+        st.markdown(
+            '<div style="color:#d95d4f;font-weight:600;">'
+            "⚠️ 未达到目标产能，建议使用 AI 推荐提速"
+            f"（当前实际 {format_display_number(actual_capacity_value, 1)} 件/小时 &lt; "
+            f"目标 {format_display_number(target_capacity_value, 1)} 件/小时）"
+            "</div>",
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            '<div style="color:#2e7d32;font-weight:600;">'
+            "✅ 已达到目标产能"
+            f"（当前实际 {format_display_number(actual_capacity_value, 1)} 件/小时 ≥ "
+            f"目标 {format_display_number(target_capacity_value, 1)} 件/小时）"
+            "</div>",
+            unsafe_allow_html=True,
+        )
+
 if ai_enabled:
+    # 解析完成/失败后都会主动 st.rerun()，结果消息统一放到下一轮渲染，
+    # 避免同一次运行中反复增删前端元素触发 removeChild 崩溃。
+    for message_key, render_message in (
+        ("ai_parse_error", st.error),
+        ("ai_parse_warning", st.warning),
+        ("ai_parse_success", st.success),
+    ):
+        if message_key in st.session_state:
+            render_message(st.session_state.pop(message_key))
+
     ai_description = st.text_area("用自然语言描述改动", key="ai_change_description")
     if st.button("AI 解析", key="parse_ai_change"):
         if not ai_description.strip():
@@ -1351,6 +2486,9 @@ if ai_enabled:
         else:
             st.session_state["ai_parsed_result"] = None
             st.session_state["ai_parse_mode"] = None
+            st.session_state.pop("ai_parse_error", None)
+            st.session_state.pop("ai_parse_warning", None)
+            st.session_state.pop("ai_parse_success", None)
             api_key = ""
             try:
                 from openai import OpenAI
@@ -1361,82 +2499,171 @@ if ai_enabled:
                 model_name = str(provider_config.get("model", "") or "").strip()
                 provider_name = str(provider_config.get("provider", "") or "")
 
+                if provider_name == "默认 DeepSeek":
+                    # 强制使用 DeepSeek 官方配置，避免被旧的会话状态覆盖
+                    if not api_key:
+                        api_key = (
+                            str(st.session_state.get("manual_api_key", "") or "").strip()
+                            or safe_get_secret("DEEPSEEK_API_KEY")
+                        )
+                    base_url = "https://api.deepseek.com"
+                    model_name = "deepseek-chat"
+
                 if not api_key and provider_name != "本地 Ollama":
+                    # 明确告知：没有 Key 时绝不发起请求，也不伪造 AI 结果
                     st.session_state["ai_parsed_result"] = rule_based_parse(ai_description)
-                    st.session_state["ai_parse_mode"] = "规则兜底模式"
-                    st.warning("未配置密钥，已自动启用本地规则引擎进行解析。")
-                    raise RuntimeError("NO_API_KEY_FALLBACK")
-
-                if not base_url or not model_name:
-                    raise ValueError("请在 AI 设置区填写 base_url 和 model")
-
-                station_options = list(st.session_state.get("current_station_takts", {}))
-                client = OpenAI(
-                    api_key=api_key or "ollama",
-                    base_url=base_url,
-                    timeout=30,
-                )
-                response = client.chat.completions.create(
-                    model=model_name,
-                    messages=[
-                        {
-                            "role": "system",
-                            "content": (
-                                "你是产线重配置助手。根据用户描述，只返回一个合法 JSON 对象，"
-                                '字段必须是 {"工位":"B精装","要求":["国产","高精度"],"目标产能":120}。'
-                                "工位必须来自给定列表；若用户使用 A、B 等简称，映射到对应工位。"
-                                "要求必须是字符串数组；高精度表示精度误差不大于 0.02 mm。"
-                                "目标产能必须是大于 0 的数字，不要输出 Markdown 或额外说明。"
-                            ),
-                        },
-                        {
-                            "role": "user",
-                            "content": (
-                                f"当前产线工位：{json.dumps(station_options, ensure_ascii=False)}\n"
-                                f"用户描述：{ai_description}"
-                            ),
-                        },
-                    ],
-                    response_format={"type": "json_object"},
-                )
-                parsed_result = json.loads(response.choices[0].message.content)
-                if not isinstance(parsed_result, dict):
-                    raise ValueError("AI 返回内容不是 JSON 对象")
-                if not all(key in parsed_result for key in ("工位", "要求", "目标产能")):
-                    raise ValueError("AI 返回结果缺少必需字段")
-                if not isinstance(parsed_result["要求"], list) or not all(
-                    isinstance(item, str) for item in parsed_result["要求"]
-                ):
-                    raise ValueError("AI 返回的要求字段格式不正确")
-                parsed_result["工位"] = resolve_line_station(
-                    parsed_result["工位"], station_options
-                )
-                parsed_result["目标产能"] = float(parsed_result["目标产能"])
-                if parsed_result["目标产能"] <= 0:
-                    raise ValueError("AI 返回的目标产能必须大于 0")
-                st.session_state["ai_parsed_result"] = parsed_result
-                st.session_state["ai_parse_mode"] = "AI 模式"
-            except RuntimeError as error:
-                if str(error) == "NO_API_KEY_FALLBACK":
-                    pass
+                    st.session_state["ai_parse_mode"] = "规则兜底模式（未发起网络请求）"
+                    st.session_state["ai_parse_warning"] = (
+                        "未检测到 API Key：本次未向任何 AI 服务发起网络请求，"
+                        "已使用本地规则引擎。"
+                    )
+                    # 数据已更新，强制重新加载页面
+                    st.rerun()
                 else:
-                    raise
+                    if not base_url or not model_name:
+                        raise ValueError("请在 AI 设置区填写 base_url 和 model")
+
+                    station_options = list(st.session_state.get("current_station_takts", {}))
+                    client = OpenAI(
+                        api_key=api_key or "ollama",
+                        base_url=base_url,
+                        timeout=30,
+                    )
+                    request_url = f"{base_url.rstrip('/')}/chat/completions"
+                    st.info(
+                        f"正在向 {request_url} 发起真实请求"
+                        f"（model={model_name}，API Key 长度 {len(api_key)}）..."
+                    )
+                    print(
+                        f"[AI 调试] 发起请求 {request_url} model={model_name} "
+                        f"key_length={len(api_key)} provider={provider_name}",
+                        flush=True,
+                    )
+                    system_prompt = (
+                        "你是产线重配置助手。根据用户描述，只返回一个合法 JSON 对象，"
+                        '字段必须是 {"工位":"B精装","要求":["国产","高精度"],"目标产能":120}。\n'
+                        "【全局范围】当描述包含 整条/整线/全线/整体/全部工位/所有工位 "
+                        '等全局范围词时，工位必须输出 "全部"，不得映射为单个工位。\n'
+                        "【严格映射规则】请严格根据用户输入提取要求，绝对不允许混淆以下概念：\n"
+                        '- 降低速度/减速/变慢/降低节拍 -> "全局降速"\n'
+                        '- 提高速度/提速/加快/变快 -> "全局提速"\n'
+                        '- 降低质量/降质/精度变差/降低精度 -> "全局降质"\n'
+                        '- 提高质量/提质/提高精度 -> "全局提质"\n'
+                        '- 降低成本/降本/省钱 -> "全局降本"\n'
+                        '- 增加成本/提价/涨价 -> "全局提价"\n'
+                        '- 缩小占地/省地/减少空间 -> "全局省地"\n'
+                        '- 扩大占地/增加空间/占地变大 -> "全局增地"\n'
+                        '禁止把"速度"相关表述输出为质量指令，也禁止把"质量"相关表述输出为速度指令。\n'
+                        "【示例】\n"
+                        "用户输入：降低速度\n"
+                        '输出：{"工位": "全部", "要求": ["全局降速"], "目标产能": 0}\n'
+                        "用户输入：提高质量\n"
+                        '输出：{"工位": "全部", "要求": ["全局提质"], "目标产能": 0}\n'
+                        "用户输入：整条产线提速，并且成本要低\n"
+                        '输出：{"工位": "全部", "要求": ["全局提速", "全局降本"], "目标产能": 0}\n'
+                        "要求必须是字符串数组；高精度表示精度误差不大于 0.02 mm。"
+                        "目标产能必须是大于等于 0 的数字；0 表示用户未提出产能诉求。"
+                        "如果用户提到降低质量，必须在 requirements（要求）数组中"
+                        "输出 '全局降质'，严禁返回空数组。"
+                        "严禁输出 JSON 以外的任何内容，不要输出 Markdown。"
+                    )
+                    response = client.chat.completions.create(
+                        model=model_name,
+                        messages=[
+                            {
+                                "role": "system",
+                                "content": system_prompt,
+                            },
+                            {
+                                "role": "user",
+                                "content": (
+                                    f"当前产线工位：{json.dumps(station_options, ensure_ascii=False)}\n"
+                                    f"用户描述：{ai_description}"
+                                ),
+                            },
+                        ],
+                        response_format={"type": "json_object"},
+                    )
+                    usage = getattr(response, "usage", None)
+                    total_tokens = getattr(usage, "total_tokens", "未知")
+                    st.session_state["ai_parse_success"] = (
+                        f"DeepSeek 响应成功！model={getattr(response, 'model', model_name)}，"
+                        f"本次消耗 tokens={total_tokens}"
+                    )
+                    print(
+                        f"[AI 调试] 响应成功 model={getattr(response, 'model', model_name)} "
+                        f"tokens={total_tokens}",
+                        flush=True,
+                    )
+
+                    parsed_result = json.loads(response.choices[0].message.content)
+                    if not isinstance(parsed_result, dict):
+                        raise ValueError("AI 返回内容不是 JSON 对象")
+                    if not all(key in parsed_result for key in ("工位", "要求", "目标产能")):
+                        raise ValueError("AI 返回结果缺少必需字段")
+                    if not isinstance(parsed_result["要求"], list) or not all(
+                        isinstance(item, str) for item in parsed_result["要求"]
+                    ):
+                        raise ValueError("AI 返回的要求字段格式不正确")
+                    detected_global_operations = detect_global_operations(
+                        ai_description
+                    )
+                    has_explicit_station = any(
+                        str(name).strip()
+                        and str(name).lower() in ai_description.lower()
+                        for name in station_options
+                    )
+                    force_global = is_global_speed_request(ai_description) or (
+                        detected_global_operations and not has_explicit_station
+                    )
+                    if force_global:
+                        parsed_result["工位"] = "全部"
+                    else:
+                        try:
+                            parsed_result["工位"] = resolve_line_station(
+                                parsed_result["工位"], station_options
+                            )
+                        except ValueError:
+                            # 安全检查：工位既不是“全部”也不在当前产线中时，
+                            # 不抛异常崩溃，降级为整线应用并在 rerun 后提示用户。
+                            parsed_result["工位"] = "全部"
+                            st.session_state["ai_parse_warning"] = (
+                                "未找到对应的工位，已默认应用至整条产线"
+                            )
+                    # 目标产能允许为 0（表示用户没有改变产能的诉求），不做强校验
+                    parsed_result["目标产能"] = max(
+                        normalize_numeric(parsed_result.get("目标产能", 0)), 0.0
+                    )
+                    st.session_state["ai_parsed_result"] = parsed_result
+                    st.session_state["ai_parse_mode"] = "AI 模式"
+                    # 数据已更新，强制重新加载页面，避免前端 DOM 复用导致 removeChild 崩溃
+                    st.rerun()
             except Exception as error:
+                # 完整堆栈写入服务端日志，并把错误原样呈现给用户，绝不静默吞掉
+                traceback.print_exc()
+                st.session_state.pop("ai_parse_success", None)
+                error_message = (
+                    f"AI 解析真实报错: {type(error).__name__}: "
+                    f"{format_exception_detail(error, api_key)}"
+                )
+                print(f"[AI 解析失败] {error_message}", flush=True)
+                st.session_state["ai_parse_error"] = error_message
                 try:
                     st.session_state["ai_parsed_result"] = rule_based_parse(ai_description)
                     st.session_state["ai_parse_mode"] = "规则兜底模式"
-                    st.warning("AI 不可用，已自动切换到规则兜底模式。")
+                    st.session_state["ai_parse_warning"] = (
+                        "AI 调用失败，已切换为本地规则引擎解析。"
+                    )
                 except Exception as fallback_error:
+                    traceback.print_exc()
                     st.session_state["ai_parsed_result"] = None
                     st.session_state["ai_parse_mode"] = None
-                    st.error("AI 不可用，请关闭开关或稍后重试")
-                    error = RuntimeError(f"{error}; 规则兜底失败：{fallback_error}")
-                error_details = str(error)
-                if api_key:
-                    error_details = error_details.replace(api_key, "[API Key 已隐藏]")
-                error_details = re.sub(r"sk-[A-Za-z0-9_-]+", "[API Key 已隐藏]", error_details)
-                with st.expander("查看错误详情"):
-                    st.code(f"{type(error).__name__}: {error_details}")
+                    st.session_state["ai_parse_error"] = (
+                        f"{error_message}；规则兜底也失败: "
+                        f"{type(fallback_error).__name__}: {fallback_error}"
+                    )
+                # 兜底结果已写入会话状态，强制重新加载页面统一渲染
+                st.rerun()
 
     parsed_result = st.session_state.get("ai_parsed_result")
     if parsed_result is not None:
@@ -1444,11 +2671,45 @@ if ai_enabled:
         st.json(parsed_result)
         if st.button("确认执行", key="confirm_ai_change"):
             try:
-                station, selected_model, target_capacity = choose_model_for_ai(
+                if parsed_result.get("工位") == "全部":
+                    requirements = [
+                        str(item) for item in parsed_result.get("要求", [])
+                    ]
+                    # 兼容 AI 返回的不同措辞：统一走关键词提取
+                    operations = []
+                    for requirement in requirements:
+                        for operation in detect_global_operations(
+                            requirement
+                        ):
+                            if operation not in operations:
+                                operations.append(operation)
+                    if not operations:
+                        operations = detect_global_operations(
+                            st.session_state.get("ai_change_description", "")
+                        )
+                    if not operations:
+                        operations = ["全局提速"]
+                    st.session_state["ai_pending_apply"] = {
+                        "station": "全部",
+                        "operation": operations,
+                    }
+                    st.session_state["ai_parsed_result"] = None
+                    st.rerun()
+                (
+                    station,
+                    selected_model,
+                    target_capacity,
+                    selection_warning,
+                ) = choose_model_for_ai(
                     st.session_state["arm_database"],
                     parsed_result,
                     list(st.session_state["current_station_takts"]),
                 )
+                if selected_model is None:
+                    st.session_state["ai_parse_warning"] = (
+                        selection_warning or "库中无符合条件的机型"
+                    )
+                    st.rerun()
                 takt = float(selected_model["节拍秒数"])
                 if takt.is_integer():
                     takt = int(takt)
@@ -1461,15 +2722,23 @@ if ai_enabled:
                 st.session_state["ai_parsed_result"] = None
                 st.rerun()
             except ValueError as error:
-                st.warning(str(error))
+                # 暂存提示后强制重载，避免在旧组件上直接打补丁
+                st.session_state["ai_parse_warning"] = str(error)
+                st.rerun()
             except Exception as error:
-                st.error(f"无法执行该方案：{error}")
+                traceback.print_exc()
+                st.session_state["ai_parse_error"] = f"无法执行该方案：{error}"
+                st.rerun()
 else:
     st.session_state["ai_parsed_result"] = None
     st.session_state["ai_parse_mode"] = None
 
 if "ai_apply_notice" in st.session_state:
     st.success(st.session_state.pop("ai_apply_notice"))
+if "ai_apply_warning" in st.session_state:
+    st.warning(st.session_state.pop("ai_apply_warning"))
+if "ai_apply_error" in st.session_state:
+    st.error(st.session_state.pop("ai_apply_error"))
 
 if uploaded_database is not None:
     try:
@@ -1477,6 +2746,8 @@ if uploaded_database is not None:
         st.session_state["arm_database"] = imported_database
         st.session_state["arm_database_name"] = uploaded_database.name
         st.session_state["arm_database_is_builtin"] = False
+        # 机械臂库变化后，允许基于新库重新执行全局寻优
+        st.session_state["station_optimization_flags"] = {}
         st.success(f"已导入 {len(imported_database)} 条机械臂数据，后续候选机型将使用此数据库。")
     except (ValueError, ImportError) as error:
         st.error(f"机械臂数据库导入失败：{error}")
@@ -1492,7 +2763,14 @@ st.caption(
 )
 if st.session_state.get("show_arm_database", False):
     st.dataframe(
-        MODEL_LIBRARY,
+        MODEL_LIBRARY.drop(
+            columns=[
+                column
+                for column in MODEL_LIBRARY.columns
+                if str(column).startswith("_")
+            ],
+            errors="ignore",
+        ),
         use_container_width=True,
         height=360,
         hide_index=True,
@@ -1514,7 +2792,7 @@ with candidate_col:
     if model_options and st.session_state.get("new_station_model") not in model_options:
         st.session_state.pop("new_station_model", None)
 
-    with st.expander("产线结构自定义", expanded=True):
+    with st.expander("⚙️ 产线结构自定义（点击展开）", expanded=False):
         with st.form("add_station_form"):
             new_station_name = st.text_input("新工位名称", key="new_station_name")
             insert_position = st.selectbox(
@@ -1533,6 +2811,7 @@ with candidate_col:
                 st.info("机械臂数据库中暂无可选机型。")
             add_station_submitted = st.form_submit_button(
                 "添加工位",
+                key="add_station_submit",
                 disabled=not model_options,
             )
 
@@ -1562,9 +2841,12 @@ with candidate_col:
                 station_to_delete = st.selectbox(
                     "选择要删除的工位",
                     [item["name"] for item in st.session_state["production_line"]],
-                    key="delete_station",
+                    key="delete_station_select",
                 )
-                delete_station_submitted = st.form_submit_button("删除工位")
+                delete_station_submitted = st.form_submit_button(
+                    "删除工位",
+                    key="delete_station_submit",
+                )
             if delete_station_submitted:
                 st.session_state["line_pending_delete"] = station_to_delete
                 st.rerun()
@@ -1575,7 +2857,110 @@ with candidate_col:
         st.success(st.session_state.pop("line_edit_notice"))
 
     if st.session_state["production_line"]:
-        selected_ws = st.session_state.get("selected_ws") or next(iter(st.session_state["current_station_takts"]), None)
+        # 图表选择等“本轮渲染后才知道”的工位切换先暂存，
+        # 下一轮在目标工位控件实例化之前再写入其 key，避免状态修改冲突。
+        pending_station = st.session_state.pop("_pending_station_switch", None)
+        if pending_station:
+            switch_selected_station(pending_station)
+
+        station_options = list(st.session_state["current_station_takts"])
+        selected_ws = (
+            st.session_state.get("selected_ws")
+            or st.session_state.get("arm_recommend_station")
+            or next(iter(station_options), None)
+        )
+        if selected_ws not in station_options:
+            selected_ws = next(iter(station_options), None)
+
+        with st.expander("🌟 综合最优推荐（自定义权重）", expanded=False):
+            st.caption(f"当前推荐工位：{selected_ws or '未选中'}")
+            weight_columns = st.columns(2)
+            with weight_columns[0]:
+                precision_weight = st.slider(
+                    "精度权重",
+                    min_value=1,
+                    max_value=10,
+                    value=10,
+                    key="custom_recommend_precision_weight",
+                )
+                speed_weight = st.slider(
+                    "效率/速度权重",
+                    min_value=1,
+                    max_value=10,
+                    value=8,
+                    key="custom_recommend_speed_weight",
+                )
+            with weight_columns[1]:
+                cost_weight = st.slider(
+                    "成本权重",
+                    min_value=1,
+                    max_value=10,
+                    value=6,
+                    key="custom_recommend_cost_weight",
+                )
+                space_weight = st.slider(
+                    "占地权重",
+                    min_value=1,
+                    max_value=10,
+                    value=4,
+                    key="custom_recommend_space_weight",
+                )
+
+            if st.button(
+                "开始智能推荐",
+                key="start_custom_weight_recommendation",
+                width="stretch",
+                disabled=MODEL_LIBRARY.empty or not selected_ws,
+            ):
+                station_candidates = get_station_candidate_models(
+                    MODEL_LIBRARY,
+                    selected_ws,
+                )
+                ranked_candidates, scores = comprehensive_model_scores(
+                    station_candidates,
+                    precision_weight,
+                    speed_weight,
+                    cost_weight,
+                    space_weight,
+                )
+                if ranked_candidates.empty:
+                    st.session_state.pop("custom_weight_recommendation", None)
+                    st.warning("当前工位没有可用于综合推荐的机械臂数据。")
+                else:
+                    best_index = scores.idxmax()
+                    st.session_state["custom_weight_recommendation"] = {
+                        "station": selected_ws,
+                        "model": ranked_candidates.loc[best_index].to_dict(),
+                        "score": float(scores.loc[best_index]),
+                    }
+
+            custom_recommendation = st.session_state.get(
+                "custom_weight_recommendation"
+            )
+            if (
+                custom_recommendation
+                and custom_recommendation.get("station") == selected_ws
+            ):
+                best_model = custom_recommendation["model"]
+                st.success(
+                    f"系统已为您推荐最优机型：{best_model.get('机型', '未知机型')}（综合得分最高）"
+                )
+                st.caption(
+                    f"综合得分：{custom_recommendation['score']:.2f}"
+                    f" · 精度 ±{normalize_numeric(best_model.get('精度(mm)', 0)):g} mm"
+                    f" · 节拍 {format_display_number(best_model.get('节拍秒数', 0), 1)} 秒"
+                    f" · 成本 {format_display_number(best_model.get('成本(万元)', 0), 2)} 万元"
+                    f" · 占地 {format_display_number(best_model.get('占地估算(㎡)', 0), 2)} ㎡"
+                )
+                if st.button(
+                    "一键采用推荐机型",
+                    key="apply_custom_weight_recommendation",
+                    width="stretch",
+                ):
+                    if apply_model_to_station(best_model, selected_ws):
+                        st.session_state.pop("custom_weight_recommendation", None)
+                        st.rerun()
+
         st.caption(f"当前待替换工位：{selected_ws or '未选中'}")
         line_station_options = list(st.session_state["current_station_takts"])
         if st.session_state.get("arm_recommend_station") not in line_station_options:
@@ -1630,8 +3015,15 @@ with candidate_col:
                 placeholder="例如：机加工上下料，工件较重，希望缩短节拍",
                 key="arm_recommend_scenario",
             )
-            filter_submitted = st.form_submit_button("筛选候选机械臂")
-            recommend_submitted = st.form_submit_button("🤖 AI 智能推荐", type="primary")
+            filter_submitted = st.form_submit_button(
+                "筛选候选机械臂",
+                key="submit_arm_filter",
+            )
+            recommend_submitted = st.form_submit_button(
+                "🤖 AI 智能推荐",
+                key="submit_ai_arm_recommendation",
+                type="primary",
+            )
 
         if filter_submitted or recommend_submitted:
             st.session_state["arm_filter_conditions"] = {
@@ -1648,6 +3040,7 @@ with candidate_col:
                 st.session_state.pop("arm_recommendation", None)
 
         if not st.session_state.get("arm_filter_submitted"):
+            st.session_state.pop("filtered_arms", None)
             st.info("按第1级～第3级条件筛选后，点击“筛选候选机械臂”。")
         else:
             conditions = st.session_state["arm_filter_conditions"]
@@ -1673,6 +3066,11 @@ with candidate_col:
                     precision_limit=99,
                     require_vision=False,
                 )
+
+            # 持久化筛选结果，供右侧“手动更换当前工位机械臂”下拉框联动使用
+            st.session_state["filtered_arms"] = (
+                filtered_models["机型"].dropna().astype(str).drop_duplicates().tolist()
+            )
 
             if recommend_submitted:
                 api_key = str(
@@ -1728,7 +3126,7 @@ with candidate_col:
                                 st.write(f"**耐用性：** {model.get('耐用性', '未注明')}")
                                 st.write(f"**视觉功能：** {'支持' if vision_supported else '不支持'}")
                             st.write(
-                                f"节拍：{normalize_numeric(model.get('节拍秒数', 20)):g} 秒　|　"
+                                f"节拍：{format_display_number(model.get('节拍秒数', 20), 1)} 秒　|　"
                                 f"维保：{model.get('维保响应', '24小时')}　|　价格：{model.get('价格', '未注明')}"
                             )
                             st.success(f"🟢 优势（Pros）：{model.get('Pros', '参数配置均衡')}")
@@ -1757,6 +3155,11 @@ with candidate_col:
                 )
                 if "未配置 API Key" in recommendation["source"]:
                     st.info("已使用本地规则为您推荐。")
+                elif "AI 服务暂不可用" in recommendation["source"]:
+                    st.error(
+                        "DeepSeek 调用失败："
+                        f"{st.session_state.get('ai_last_error', '未知错误')}"
+                    )
                 if st.button("采用推荐机型", key=f"apply_ai_recommendation_{selected_ws}", type="primary"):
                     if apply_model_to_station(recommended_model, selected_ws):
                         st.session_state.pop("arm_recommendation", None)
@@ -1774,7 +3177,10 @@ with chart_col:
         if "selected_ws" not in st.session_state or st.session_state["selected_ws"] not in cycle_times:
             st.session_state["selected_ws"] = next(iter(cycle_times), None)
 
-        st.metric("估算整线产能（件/小时）", f"{3600 / bottleneck_takt:.1f}")
+        st.metric(
+            "估算整线产能（件/小时）",
+            format_display_number(3600 / bottleneck_takt, 1),
+        )
         topology_stations = list(cycle_times.items())
         topology_spacing = 2.4
         topology_node_size = 96
@@ -1850,8 +3256,16 @@ with chart_col:
         chart_event = st.session_state.get(chart_key)
         if isinstance(chart_event, dict):
             selected_station = extract_selected_station_from_event(chart_event)
-            if selected_station and selected_station in cycle_times:
-                st.session_state["selected_ws"] = selected_station
+            if (
+                selected_station
+                and selected_station in cycle_times
+                and selected_station != st.session_state.get("_last_chart_station")
+            ):
+                # 不在本轮直接改 st.session_state["arm_recommend_station"]
+                # （对应控件本轮已实例化），改为暂存后 rerun 生效。
+                st.session_state["_last_chart_station"] = selected_station
+                st.session_state["_pending_station_switch"] = selected_station
+                st.rerun()
 
         st.plotly_chart(
             topology_figure,
@@ -1859,86 +3273,117 @@ with chart_col:
             use_container_width=True,
             on_select="rerun",
             selection_mode="points",
-            config={"displayModeBar": False, "scrollZoom": False},
+            config={
+                "displayModeBar": False,
+                "staticPlot": True,
+                "scrollZoom": False,
+            },
         )
 
         station_columns = st.columns(min(len(topology_stations), 5))
         for idx, (station, _) in enumerate(topology_stations):
             with station_columns[idx % len(station_columns)]:
-                if st.button(station, key=f"station_button_{station}", use_container_width=True):
-                    st.session_state["selected_ws"] = station
-                    st.rerun()
+                st.button(
+                    station,
+                    key=f"station_button_{station}",
+                    use_container_width=True,
+                    on_click=switch_selected_station,
+                    args=(station,),
+                )
 
         selected_ws = st.session_state.get("selected_ws")
         if selected_ws and selected_ws in cycle_times:
-            selected_station_models = get_station_candidate_models(MODEL_LIBRARY, selected_ws)
             with st.container():
                 st.caption(f"当前选中工位：{selected_ws}")
-                if selected_station_models.empty:
-                    st.warning(f"当前工位“{selected_ws}”没有可用机械臂数据，已回退到全库候选。")
-                    selected_station_models = MODEL_LIBRARY.copy()
+
+                # 与左侧“筛选候选机械臂”联动：
+                # 已筛选时只展示筛选结果，未筛选时展示全局机械臂库。
+                if st.session_state.get("arm_filter_submitted"):
+                    filtered_arm_names = st.session_state.get("filtered_arms", [])
+                    replacement_candidates = MODEL_LIBRARY[
+                        MODEL_LIBRARY["机型"].dropna().astype(str).isin(filtered_arm_names)
+                    ]
+                    if replacement_candidates.empty:
+                        replacement_candidates = MODEL_LIBRARY.copy()
+                else:
+                    replacement_candidates = MODEL_LIBRARY.copy()
 
                 model_options = (
-                    selected_station_models["机型"].dropna().astype(str).drop_duplicates().tolist()
+                    replacement_candidates["机型"].dropna().astype(str).drop_duplicates().tolist()
                 )
                 if not model_options:
                     model_options = ["无可用机型"]
 
                 current_model = st.session_state["current_station_models"].get(selected_ws, "未配置")
                 default_index = model_options.index(current_model) if current_model in model_options else 0
-                with st.form(f"replace_arm_form_{selected_ws}"):
-                    replacement_model = st.selectbox(
-                        "更换机械臂",
-                        model_options,
-                        index=default_index,
-                        key=f"replacement_model_{selected_ws}",
-                    )
-                    submitted = st.form_submit_button(
-                        "确认替换",
-                        disabled=(replacement_model == "无可用机型"),
-                    )
-                if submitted and replacement_model != "无可用机型":
-                    selected_row = selected_station_models[
-                        selected_station_models["机型"].astype(str) == replacement_model
-                    ].iloc[0]
-                    target_station = next(
-                        item for item in st.session_state["production_line"]
-                        if item["name"] == selected_ws
-                    )
-                    takt_value = float(selected_row["节拍秒数"])
-                    if takt_value.is_integer():
-                        takt_value = int(takt_value)
-                    target_station["model"] = replacement_model
-                    target_station["takt"] = takt_value
-                    sync_line_state()
-                    calc_line_takt(st.session_state["current_station_takts"])
-                    st.rerun()
+                with st.expander("🔧 手动更换当前工位机械臂", expanded=False):
+                    with st.form(f"replace_arm_form_{selected_ws}"):
+                        replacement_model = st.selectbox(
+                            "更换机械臂",
+                            model_options,
+                            index=default_index,
+                            key=f"replacement_model_{selected_ws}",
+                        )
+                        submitted = st.form_submit_button(
+                            "确认替换",
+                            key=f"confirm_replacement_{selected_ws}",
+                            disabled=(replacement_model == "无可用机型"),
+                        )
+                    if submitted and replacement_model != "无可用机型":
+                        selected_row = replacement_candidates[
+                            replacement_candidates["机型"].astype(str) == replacement_model
+                        ].iloc[0]
+                        apply_model_to_station(selected_row, selected_ws)
+                        calc_line_takt(st.session_state["current_station_takts"])
+                        st.rerun()
 
-        st.subheader("整线节拍与瓶颈")
-
-        # 根据当前工位节拍重算瓶颈，并用红色突出显示
-        bar_colors = [
-            "#d95d4f" if operation == bottleneck else "#39856a"
-            for operation in cycle_times
+        st.subheader("优化前后节拍对比")
+        st.caption(
+            "柱子越矮代表干活越快，红色代表瓶颈。选型后柱子变矮，说明整线速度变快了。"
+        )
+        initial_takts = {
+            item["name"]: float(item["takt"])
+            for item in st.session_state["initial_production_line"]
+        }
+        stations = list(cycle_times)
+        before_values = [
+            initial_takts.get(station, float(cycle_times[station]))
+            for station in stations
+        ]
+        after_values = [float(cycle_times[station]) for station in stations]
+        current_bar_colors = [
+            "#d95d4f" if takt == bottleneck_takt else "#39856a"
+            for takt in after_values
         ]
 
         figure = go.Figure(
             data=[
                 go.Bar(
-                    x=list(cycle_times.keys()),
-                    y=list(cycle_times.values()),
-                    marker_color=bar_colors,
-                    text=list(cycle_times.values()),
+                    name="优化前（初始状态）",
+                    x=stations,
+                    y=before_values,
+                    marker_color="#b8bec7",
+                    text=[format_display_number(takt, 1) for takt in before_values],
                     textposition="outside",
-                    hovertemplate="%{x}<br>节拍：%{y} 秒<extra></extra>",
-                )
+                    hovertemplate="%{x}<br>优化前节拍：%{y:.1f} 秒<extra></extra>",
+                ),
+                go.Bar(
+                    name="优化后（当前状态）",
+                    x=stations,
+                    y=after_values,
+                    marker_color=current_bar_colors,
+                    text=[format_display_number(takt, 1) for takt in after_values],
+                    textposition="outside",
+                    hovertemplate="%{x}<br>优化后节拍：%{y:.1f} 秒<extra></extra>",
+                ),
             ]
         )
         figure.update_layout(
             height=420,
             margin={"l": 20, "r": 20, "t": 28, "b": 20},
             template="streamlit",
-            showlegend=False,
+            barmode="group",
+            showlegend=True,
             xaxis={
                 "title": {"text": "工序"},
                 "showgrid": False,
@@ -1952,7 +3397,207 @@ with chart_col:
         )
         st.plotly_chart(
             figure,
-            width="stretch",
-            config={"displayModeBar": False, "staticPlot": True, "editable": False, "scrollZoom": False},
+            use_container_width=True,
+            config={
+                "displayModeBar": False,
+                "staticPlot": True,
+                "scrollZoom": False,
+            },
         )
-        st.warning(f"当前瓶颈：{bottleneck} {bottleneck_takt} 秒")
+        initial_bottleneck, initial_bottleneck_takt = calc_line_takt(initial_takts)
+        if initial_bottleneck_takt is not None:
+            time_change = round(
+                float(initial_bottleneck_takt) - float(bottleneck_takt), 1
+            )
+            if time_change > 0:
+                time_summary = f"单件作业时间缩短了 {time_change:.1f} 秒"
+            elif time_change < 0:
+                time_summary = f"单件作业时间增加了 {abs(time_change):.1f} 秒"
+            else:
+                time_summary = "单件作业时间未变化"
+
+            initial_capacity_24h = 86400 / float(initial_bottleneck_takt)
+            current_capacity_24h = 86400 / float(bottleneck_takt)
+            capacity_change = round(current_capacity_24h - initial_capacity_24h, 1)
+            if capacity_change > 0:
+                capacity_summary = f"理论产能提升了 {capacity_change:.1f} 件"
+            elif capacity_change < 0:
+                capacity_summary = f"理论产能减少了 {abs(capacity_change):.1f} 件"
+            else:
+                capacity_summary = "理论产能未变化"
+
+            st.markdown(
+                f"""
+                <div style="padding: 16px 18px; border-left: 6px solid #39856a;
+                            background: rgba(57, 133, 106, 0.12); border-radius: 8px;
+                            font-size: 1.05rem; line-height: 1.7;">
+                    <strong>优化效果：</strong>相比初始状态，{time_summary}
+                    （原瓶颈 {format_display_number(initial_bottleneck_takt, 1)} 秒 →
+                    现瓶颈 {format_display_number(bottleneck_takt, 1)} 秒）。
+                    <br><strong>产能变化：</strong>产线 24 小时理论产能{capacity_summary}
+                    （{format_display_number(initial_capacity_24h, 1)} 件 →
+                    {format_display_number(current_capacity_24h, 1)} 件）。
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            st.warning(
+                f"当前瓶颈：{bottleneck} {format_display_number(bottleneck_takt, 1)} 秒"
+            )
+
+    with st.expander("📊 展开查看：成本与占地分析"):
+        if not st.session_state["production_line"]:
+            st.info("添加工位后将显示当前机型的成本与占地分析。")
+        else:
+            analysis_stations = []
+            analysis_models = []
+            analysis_costs = []
+            analysis_areas = []
+            for line_item in st.session_state["production_line"]:
+                station_name = line_item["name"]
+                model_name = str(line_item.get("model", "未配置"))
+                model_rows = MODEL_LIBRARY[
+                    MODEL_LIBRARY["机型"].astype(str) == model_name
+                ]
+                station_rows = model_rows[
+                    model_rows["工位"].astype(str).map(
+                        lambda label: normalize_station_label(label)
+                        == normalize_station_label(station_name)
+                    )
+                ]
+                if not station_rows.empty:
+                    model_row = station_rows.iloc[0]
+                elif not model_rows.empty:
+                    model_row = model_rows.iloc[0]
+                else:
+                    model_row = None
+
+                analysis_stations.append(station_name)
+                analysis_models.append(model_name)
+
+                # 优先使用工位级覆盖值（按比例缩放后的价格/占地）
+                price_override = line_item.get("price")
+                reach_override = line_item.get("reach")
+                if price_override is not None:
+                    cost_value = normalize_numeric(price_override) / 10000
+                elif model_row is not None:
+                    cost_value = normalize_numeric(
+                        model_row.get("成本(万元)", 0)
+                    )
+                else:
+                    cost_value = 0.0
+
+                if reach_override is not None:
+                    reach_mm = normalize_numeric(reach_override)
+                    area_value = (reach_mm / 1000) ** 2 * 3.14
+                elif model_row is not None:
+                    area_value = normalize_numeric(
+                        model_row.get("占地估算(㎡)", 0)
+                    )
+                else:
+                    area_value = 0.0
+
+                # 未配置机械臂或价格/臂展字段为空时按 0 兜底，保证坐标轴正常显示
+                analysis_costs.append(max(cost_value, 0.0))
+                analysis_areas.append(max(area_value, 0.0))
+            has_cost_data = any(value > 0 for value in analysis_costs)
+            has_area_data = any(value > 0 for value in analysis_areas)
+            if not has_cost_data and not has_area_data:
+                # 全部工位都没有可用机型数据时，不画只有坐标轴的空图
+                st.info("暂无成本与占地数据，请先在左侧完成机械臂选型。")
+            else:
+                cost_axis_max = max(analysis_costs + [0.0])
+                area_axis_max = max(analysis_areas + [0.0])
+                cost_y_range = [0, round(max(cost_axis_max * 1.2, 1.0), 2)]
+                area_y_range = [0, round(max(area_axis_max * 1.2, 1.0), 2)]
+                st.caption("*注：未配置机械臂的工位按 0 计算。请在左侧完成选型。")
+
+                theme_base = st.get_option("theme.base")
+                plotly_theme = "plotly_dark" if theme_base == "dark" else "plotly_white"
+                axis_color = (
+                    "rgba(220, 220, 220, 0.3)"
+                    if theme_base == "dark"
+                    else "rgba(80, 80, 80, 0.2)"
+                )
+                analysis_left, analysis_right = st.columns(2)
+                with analysis_left:
+                    if not has_cost_data:
+                        st.info("暂无成本数据，请先在左侧完成机械臂选型。")
+                    else:
+                        cost_figure = go.Figure(
+                            go.Bar(
+                                x=analysis_stations,
+                                y=analysis_costs,
+                                text=[f"{value:.2f}" for value in analysis_costs],
+                                textposition="outside",
+                                customdata=analysis_models,
+                                marker_color="#39856a",
+                                hovertemplate=(
+                                    "%{x}<br>机型：%{customdata}"
+                                    "<br>成本：%{y:.2f} 万元<extra></extra>"
+                                ),
+                            )
+                        )
+                        cost_figure.update_layout(
+                            title="各工位机械臂成本对比图",
+                            height=350,
+                            template=plotly_theme,
+                            margin=dict(l=50, r=20, t=30, b=50),
+                            xaxis={"title": "工位", "showgrid": False},
+                            yaxis={
+                                "title": "成本（万元）",
+                                "gridcolor": axis_color,
+                                "rangemode": "tozero",
+                                "range": cost_y_range,
+                            },
+                        )
+                        st.plotly_chart(
+                            cost_figure,
+                            use_container_width=True,
+                            config={
+                                "displayModeBar": False,
+                                "staticPlot": True,
+                                "scrollZoom": False,
+                            },
+                        )
+
+                with analysis_right:
+                    if not has_area_data:
+                        st.info("暂无占地数据，请先在左侧完成机械臂选型。")
+                    else:
+                        area_figure = go.Figure(
+                            go.Bar(
+                                x=analysis_stations,
+                                y=analysis_areas,
+                                text=[f"{value:.2f}" for value in analysis_areas],
+                                textposition="outside",
+                                customdata=analysis_models,
+                                marker_color="#5479a8",
+                                hovertemplate=(
+                                    "%{x}<br>机型：%{customdata}"
+                                    "<br>占地：%{y:.2f} ㎡<extra></extra>"
+                                ),
+                            )
+                        )
+                        area_figure.update_layout(
+                            title="各工位占地空间对比图",
+                            height=350,
+                            template=plotly_theme,
+                            margin=dict(l=50, r=20, t=30, b=50),
+                            xaxis={"title": "工位", "showgrid": False},
+                            yaxis={
+                                "title": "占地（平方米）",
+                                "gridcolor": axis_color,
+                                "rangemode": "tozero",
+                                "range": area_y_range,
+                            },
+                        )
+                        st.plotly_chart(
+                            area_figure,
+                            use_container_width=True,
+                            config={
+                                "displayModeBar": False,
+                                "staticPlot": True,
+                                "scrollZoom": False,
+                            },
+                        )
