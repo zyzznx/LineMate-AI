@@ -1,8 +1,8 @@
-# 线搭子 AI · 产线方案重配置搭子 (中文说明)
+# 智能线搭子 (中文说明)
 
 ## 项目简介
 
-线搭子 AI 是面向制造业方案评估与演示的产线重配置和工业机械臂选型工具。用户可以编辑产线工位、查看节拍与瓶颈，并根据机械臂参数筛选和比较候选型号。
+智能线搭子是面向制造业方案评估与演示的产线重配置和工业机械臂选型工具。用户可以编辑产线工位、查看节拍与瓶颈，并根据机械臂参数筛选和比较候选型号。
 
 ## 核心功能
 
@@ -44,11 +44,11 @@ DEEPSEEK_API_KEY = "your_key_here"
 
 ---
 
-# LineMate AI (English Description)
+# 智能线搭子 (English Description)
 
 ## Project Overview
 
-LineMate AI is a production-line reconfiguration and industrial robot selection tool for manufacturing planning and demonstrations. Users can edit stations, inspect takt times and bottlenecks, and filter or compare robot candidates by their specifications.
+智能线搭子 is a production-line reconfiguration and industrial robot selection tool for manufacturing planning and demonstrations. Users can edit stations, inspect takt times and bottlenecks, and filter or compare robot candidates by their specifications.
 
 ## Core Features
 

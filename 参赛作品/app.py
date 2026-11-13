@@ -37,7 +37,7 @@ def clean_arm_text(value, default=""):
 
 
 st.set_page_config(
-    page_title="线搭子 AI · 产线方案重配置搭子",
+    page_title="智能线搭子",
     page_icon="🏭",
     layout="wide",
 )
@@ -2485,7 +2485,7 @@ with st.sidebar:
     st.toggle("📊 查看当前机械臂数据库", key="show_arm_database")
 
 # 页面标题
-st.title("线搭子 AI · 产线方案重配置搭子")
+st.title("智能线搭子")
 
 # 顶部输入区
 upload_col, capacity_col, ai_col = st.columns([1.5, 1.2, 1])
