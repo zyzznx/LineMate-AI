@@ -907,21 +907,48 @@ def run_global_optimization(operations):
         for operation in operations
         if operation in GLOBAL_OPTIMIZATION_OPERATIONS
     ]
+    operations = sorted(
+        set(operations),
+        key=lambda operation: list(GLOBAL_OPTIMIZATION_OPERATIONS).index(operation),
+    )
     if not operations:
         return "warning", "未知的全局优化指令。", None
 
+    global_cmd = "、".join(operations)
     production_line = st.session_state.get("production_line", [])
-    if st.session_state.get("is_globally_optimized", False):
-        return (
-            "warning",
-            "⚠️ 当前产线已是优化状态，如需重新配置，请先点击‘重置产线’或重新选择行业模板。",
-            None,
-        )
     if not production_line:
         return "warning", "当前产线没有可执行工位。", None
     if "initial_production_line" not in st.session_state:
         reset_optimization_baseline()
-    initial_takt = st.session_state.get("initial_takt", {})
+    initial_line = st.session_state["initial_production_line"]
+    initial_takt = {
+        item["name"]: normalize_numeric(item["takt"], default=float("nan"))
+        for item in initial_line
+        if "name" in item and "takt" in item
+    }
+    st.session_state["initial_takt"] = initial_takt
+    missing_baselines = [
+        item.get("name", "")
+        for item in production_line
+        if item.get("name") not in initial_takt
+        or pd.isna(initial_takt.get(item.get("name")))
+        or initial_takt.get(item.get("name")) <= 0
+    ]
+    if missing_baselines:
+        return (
+            "warning",
+            "⚠️ 无法读取工位初始节拍，请先重置产线或重新选择行业模板。",
+            None,
+        )
+    if st.session_state.get("global_cmd", "") == global_cmd:
+        return "warning", "⚠️ 当前产线已是该状态，请勿重复操作。", None
+
+    st.session_state["production_line"] = [
+        dict(item) for item in initial_line
+    ]
+    st.session_state["global_cmd"] = ""
+    sync_line_state()
+    production_line = st.session_state["production_line"]
 
     database = st.session_state.get("arm_database")
     model_library = pd.DataFrame()
@@ -1038,9 +1065,7 @@ def run_global_optimization(operations):
                 for operation in operations:
                     column = GLOBAL_OPTIMIZATION_OPERATIONS[operation]["metric"]
                     if column == "节拍秒数":
-                        current_values[column] = initial_takt.get(
-                            item.get("name"), item.get("takt")
-                        )
+                        current_values[column] = initial_takt[item["name"]]
                     else:
                         current_values[column] = _effective_item_metric(
                             item, current_model, column
@@ -1055,9 +1080,7 @@ def run_global_optimization(operations):
                 metric_column = config["metric"]
                 prefer = config["prefer"]
                 if metric_column == "节拍秒数":
-                    current_value = initial_takt.get(
-                        item.get("name"), item.get("takt")
-                    )
+                    current_value = initial_takt[item["name"]]
                 else:
                     current_value = _effective_item_metric(
                         item, current_model, metric_column
@@ -1116,9 +1139,7 @@ def run_global_optimization(operations):
                 config = GLOBAL_OPTIMIZATION_OPERATIONS[operation]
                 metric_column = config["metric"]
                 if metric_column == "节拍秒数":
-                    current_value = initial_takt.get(
-                        item.get("name"), item.get("takt")
-                    )
+                    current_value = initial_takt[item["name"]]
                 else:
                     current_value = _effective_item_metric(
                         item, current_model, metric_column
@@ -1174,7 +1195,7 @@ def run_global_optimization(operations):
             "⚠️ 未在当前数据库中找到符合要求的机型，产线未改变。",
             None,
         )
-    st.session_state["is_globally_optimized"] = True
+    st.session_state["global_cmd"] = global_cmd
 
     if is_compound:
         labels = "、".join(
@@ -1378,7 +1399,6 @@ def reset_optimization_baseline():
         for item in st.session_state["initial_production_line"]
     }
     st.session_state["optimization_applied"] = False
-    st.session_state["is_globally_optimized"] = False
     # 产线结构/模板发生变化后，清空各工位的已优化状态
     st.session_state["station_optimization_flags"] = {}
 
@@ -1388,7 +1408,7 @@ def reset_production_line():
     st.session_state["production_line"] = [dict(item) for item in baseline]
     sync_line_state()
     st.session_state["optimization_applied"] = False
-    st.session_state["is_globally_optimized"] = False
+    st.session_state["global_cmd"] = ""
     st.session_state["station_optimization_flags"] = {}
 
 
@@ -1732,7 +1752,7 @@ st.session_state.setdefault(
     {item["name"]: item["takt"] for item in st.session_state["initial_production_line"]},
 )
 st.session_state.setdefault("optimization_applied", False)
-st.session_state.setdefault("is_globally_optimized", False)
+st.session_state.setdefault("global_cmd", "")
 st.session_state.setdefault("target_capacity", 100)
 st.session_state.setdefault("ai_parsed_result", None)
 st.session_state.setdefault("ai_parse_mode", None)
